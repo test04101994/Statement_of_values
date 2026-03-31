@@ -58,15 +58,30 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
     with open(p, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Validate fields
-    fields = cfg.get("fields")
-    if not isinstance(fields, dict) or not fields:
+    # Parse fields — supports both formats:
+    #   field_name: "description"                  (flat, type defaults to text)
+    #   field_name: {desc: "description", type: "amount"}
+    raw_fields = cfg.get("fields")
+    if not isinstance(raw_fields, dict) or not raw_fields:
         raise ValueError(f"'fields' must be a non-empty mapping in {p}")
-    for k, v in fields.items():
-        if not v or not str(v).strip():
+
+    schema: dict[str, str] = {}       # field → description (for LLM)
+    field_types: dict[str, str] = {}  # field → type (for validation)
+
+    for k, v in raw_fields.items():
+        if isinstance(v, dict):
+            desc = v.get("desc", "")
+            ftype = v.get("type", "text")
+        else:
+            desc = str(v) if v else ""
+            ftype = "text"
+        if not desc.strip():
             raise ValueError(f"Field '{k}' must have a non-empty description in {p}")
-    # Normalize descriptions to plain strings
-    cfg["fields"] = {k: str(v).strip() for k, v in fields.items()}
+        schema[k] = desc.strip()
+        field_types[k] = ftype.strip().lower()
+
+    cfg["fields"] = schema
+    cfg["field_types"] = field_types
 
     return cfg
 
@@ -74,6 +89,52 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Excel I/O
 # ---------------------------------------------------------------------------
+
+
+_CURRENCY_RE = re.compile(r"[$ ,€£¥₹%]")
+
+
+def _col_letter(col_idx: int) -> str:
+    """Convert 0-based column index to Excel column letter (0→A, 25→Z, 26→AA)."""
+    result = ""
+    idx = col_idx
+    while True:
+        result = chr(65 + idx % 26) + result
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return result
+
+
+def _extract_cell_value(cell) -> object:
+    """Extract cell value, recovering numeric values hidden behind formatting.
+
+    openpyxl ``data_only=True`` usually returns the raw number, but some files
+    store formatted strings like ``"$1,200,000"`` or ``"15%"``.  This strips
+    currency/grouping symbols and returns a float when the underlying value is
+    numeric.
+    """
+    val = cell.value
+    if val is None:
+        return None
+    # Already numeric — keep as-is
+    if isinstance(val, (int, float)):
+        return val
+    # String with currency/formatting artifacts → recover numeric value.
+    # Only convert if the original string contains formatting characters
+    # ($, commas, €, etc.) — bare strings like "1" or "Yes" stay as strings.
+    if isinstance(val, str):
+        raw = val.strip()
+        if _CURRENCY_RE.search(raw) or (raw.startswith("(") and raw.endswith(")")):
+            stripped = _CURRENCY_RE.sub("", raw)
+            if stripped.startswith("(") and stripped.endswith(")"):
+                stripped = "-" + stripped[1:-1]
+            if stripped:
+                try:
+                    return float(stripped)
+                except ValueError:
+                    pass
+    return val
 
 
 def _open_workbook(filepath: str) -> openpyxl.Workbook:
@@ -85,7 +146,16 @@ def _read_sheet_rows(
     sheet_index: int,
     max_rows: int = 60,
 ) -> List[List]:
-    """Read up to *max_rows* from a worksheet, expanding merged cells."""
+    """Read up to *max_rows* from a worksheet.
+
+    - Expands simple merged cells (fills every cell in the range with the
+      top-left value).
+    - Handles nested/grouped headers: when a merged cell spans columns in
+      header rows (e.g. ``"Building Values"`` over cols 5-8), the value is
+      propagated so the preview text shows the parent label for the LLM.
+    - Strips currency/formatting artifacts from cell values via
+      ``_extract_cell_value``.
+    """
     if sheet_index >= len(wb.worksheets):
         raise IndexError(
             f"Sheet index {sheet_index} out of range "
@@ -93,16 +163,24 @@ def _read_sheet_rows(
         )
     ws = wb.worksheets[sheet_index]
 
+    # Build merged-cell lookup: every (row, col) in a merged range → top-left value
     merged: dict[tuple[int, int], object] = {}
     for rng in ws.merged_cells.ranges:
-        val = ws.cell(rng.min_row, rng.min_col).value
+        top_left_cell = ws.cell(rng.min_row, rng.min_col)
+        val = _extract_cell_value(top_left_cell)
         for r in range(rng.min_row, rng.max_row + 1):
             for c in range(rng.min_col, rng.max_col + 1):
                 merged[(r, c)] = val
 
     rows: list[list] = []
     for row_cells in ws.iter_rows(max_row=max_rows):
-        rows.append([merged.get((c.row, c.column), c.value) for c in row_cells])
+        row_vals = []
+        for cell in row_cells:
+            if (cell.row, cell.column) in merged:
+                row_vals.append(merged[(cell.row, cell.column)])
+            else:
+                row_vals.append(_extract_cell_value(cell))
+        rows.append(row_vals)
 
     max_cols = max((len(r) for r in rows), default=0)
     return [r + [None] * (max_cols - len(r)) for r in rows]
@@ -546,6 +624,87 @@ def _apply_derivations(
 
 
 # ---------------------------------------------------------------------------
+# Per-cell validation
+# ---------------------------------------------------------------------------
+
+_NA_STRINGS = frozenset({"none", "nan", "n/a", "null", "-", "", "na", "tbd", "#n/a", "#ref!"})
+
+
+def _clean_cell(val: object, ftype: str) -> object:
+    """Validate and clean a single cell value based on its field type.
+
+    Returns the cleaned value, or ``pd.NA`` if the value is invalid for the
+    type.  Never drops the row — only nulls the individual cell.
+    """
+    if val is None:
+        return pd.NA
+
+    s = str(val).strip()
+    if not s or s.lower() in _NA_STRINGS:
+        return pd.NA
+
+    if ftype == "amount":
+        # Strip currency symbols, commas, spaces
+        cleaned = _CURRENCY_RE.sub("", s)
+        # Accounting negatives: (1234) → -1234
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return pd.NA
+
+    if ftype == "integer":
+        try:
+            return int(float(s))
+        except (ValueError, TypeError):
+            return pd.NA
+
+    if ftype == "year":
+        try:
+            y = int(float(s))
+            return y if 1900 <= y <= 2099 else pd.NA
+        except (ValueError, TypeError):
+            return pd.NA
+
+    if ftype == "coordinate":
+        try:
+            v = float(s)
+            return v if -180.0 <= v <= 180.0 else pd.NA
+        except (ValueError, TypeError):
+            return pd.NA
+
+    if ftype == "boolean":
+        # Normalize: "1.0" → "1", "0.0" → "0" for numeric booleans
+        low = s.lower()
+        try:
+            low = str(int(float(low)))
+        except (ValueError, TypeError):
+            pass
+        if low in ("yes", "y", "true", "1", "sprinklered"):
+            return "Yes"
+        if low in ("no", "n", "false", "0"):
+            return "No"
+        if low in ("partial", "p"):
+            return "Partial"
+        return pd.NA
+
+    # text (default)
+    return s
+
+
+def _apply_field_types(
+    df: pd.DataFrame,
+    field_types: Dict[str, str],
+) -> pd.DataFrame:
+    """Apply per-cell validation to every column that has a type defined."""
+    for col in df.columns:
+        ftype = field_types.get(col, "text")
+        df[col] = df[col].apply(lambda v: _clean_cell(v, ftype))
+    return df
+
+
+# ---------------------------------------------------------------------------
 # DataFrame builder
 # ---------------------------------------------------------------------------
 
@@ -554,8 +713,16 @@ def build_clean_dataframe(
     rows: List[List],
     analysis: Dict[str, Any],
     schema: Dict[str, str],
-) -> pd.DataFrame:
-    """Apply LLM analysis (mappings + derivations) to raw rows → clean DataFrame."""
+    field_types: Optional[Dict[str, str]] = None,
+    sheet_name: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply LLM analysis to raw rows → (clean_df, source_ref_df).
+
+    ``source_ref_df`` has the same shape as ``clean_df`` but each cell contains
+    the Excel cell reference where the value was extracted from, e.g.
+    ``'SOV 2025'!M4``.  For derived columns the reference shows the formula
+    source cells.
+    """
     data_start = analysis.get("data_start_row", 0)
     data_end = analysis.get("data_end_row")
     col_mapping = analysis.get("column_mapping", {})
@@ -569,8 +736,12 @@ def build_clean_dataframe(
     end = (data_end + 1) if data_end is not None else len(rows)
     data_rows = rows[data_start:end]
 
+    sheet_prefix = f"'{sheet_name}'!" if sheet_name else ""
+
     records: list[dict] = []
-    for row in data_rows:
+    source_rows: list[int] = []  # original 0-based row indices that survived filtering
+
+    for row_offset, row in enumerate(data_rows):
         max_col = max(all_idx, default=0)
         if len(row) < max_col + 1:
             row = row + [None] * (max_col + 1 - len(row))
@@ -583,30 +754,64 @@ def build_clean_dataframe(
             continue
 
         records.append({str(i): row[i] for i in all_idx})
+        # Excel row = data_start + row_offset + 1 (Excel is 1-based)
+        source_rows.append(data_start + row_offset + 1)
 
     if not records:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     df_raw = pd.DataFrame(records)
 
     # Direct column mappings
     direct = {key: df_raw[idx] for idx, key in col_mapping.items() if idx in df_raw.columns}
 
+    # Build source references for direct mappings
+    direct_refs: dict[str, list[str]] = {}
+    for idx_str, key in col_mapping.items():
+        if idx_str in df_raw.columns:
+            col_letter = _col_letter(int(idx_str))
+            direct_refs[key] = [
+                f"{sheet_prefix}{col_letter}{excel_row}"
+                for excel_row in source_rows
+            ]
+
     # Derived columns
     derived = _apply_derivations(df_raw, derived_rules) if derived_rules else {}
 
+    # Build source references for derived columns
+    derived_refs: dict[str, list[str]] = {}
+    for rule in derived_rules:
+        target = rule.get("target", "")
+        dtype = rule.get("type", "")
+        src_cols = rule.get("source_cols", [])
+        if target not in derived:
+            continue
+        src_letters = [_col_letter(int(c)) for c in src_cols]
+        refs: list[str] = []
+        for excel_row in source_rows:
+            cell_refs = [f"{sheet_prefix}{ltr}{excel_row}" for ltr in src_letters]
+            refs.append(", ".join(cell_refs))
+        derived_refs[target] = refs
+
     all_cols = {**direct, **derived}
+    all_refs = {**direct_refs, **derived_refs}
 
     # Order: schema key order first, then extras
     ordered = [k for k in schema if k in all_cols]
     extras = [k for k in all_cols if k not in ordered]
-    df = pd.DataFrame({k: all_cols[k] for k in ordered + extras})
+    final_keys = ordered + extras
 
-    # Clean string columns
-    for col in df.select_dtypes(include="object").columns:
-        df[col] = df[col].astype(str).str.strip().replace({"None": pd.NA, "nan": pd.NA})
+    df = pd.DataFrame({k: all_cols[k] for k in final_keys})
+    df_sources = pd.DataFrame({k: all_refs.get(k, [""] * len(df)) for k in final_keys})
 
-    return df
+    # Apply per-cell type validation
+    if field_types:
+        df = _apply_field_types(df, field_types)
+    else:
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = df[col].astype(str).str.strip().replace({"None": pd.NA, "nan": pd.NA})
+
+    return df, df_sources
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +855,7 @@ def parse_sov_file(
                 cfg[k] = v
 
     schema = cfg["fields"]
+    field_types = cfg.get("field_types", {})
     bedrock_cfg = cfg.get("bedrock", {})
 
     llm_responses: list[dict] = []
@@ -661,11 +867,26 @@ def parse_sov_file(
         llm_responses.append({"step": "sheet_detection", **detect_resp})
     logger.info("Target sheet(s): %s", sheet_indices)
 
+    # --- Get sheet names for source references ---
+    ext = fp.rsplit(".", 1)[-1].lower()
+    sheet_names: dict[int, str] = {}
+    if ext == "xlsx":
+        wb = _open_workbook(fp)
+        for i, ws in enumerate(wb.worksheets):
+            sheet_names[i] = ws.title
+    elif ext == "xls":
+        import xlrd
+        xwb = xlrd.open_workbook(fp)
+        for i in range(xwb.nsheets):
+            sheet_names[i] = xwb.sheet_by_index(i).name
+
     # --- Parse each sheet ---
     all_dfs: list[pd.DataFrame] = []
+    all_sources: list[pd.DataFrame] = []
 
     for sheet_idx in sheet_indices:
-        logger.info("--- Processing sheet %d ---", sheet_idx)
+        sname = sheet_names.get(sheet_idx, f"Sheet{sheet_idx}")
+        logger.info("--- Processing sheet %d (%s) ---", sheet_idx, sname)
         rows = read_raw_rows(fp, sheet_idx, max_rows=preview_rows)
         preview = rows_to_preview(rows, max_rows=preview_rows)
 
@@ -690,9 +911,10 @@ def parse_sov_file(
             if dropped and verbose:
                 logger.info("Removed %d stale year column(s)", dropped)
 
-        df = build_clean_dataframe(rows, analysis, schema)
+        df, df_src = build_clean_dataframe(rows, analysis, schema, field_types, sheet_name=sname)
         if not df.empty:
             all_dfs.append(df)
+            all_sources.append(df_src)
         logger.info("Sheet %d: %d rows, %d columns", sheet_idx, len(df), len(df.columns))
 
     metadata = {
@@ -703,26 +925,31 @@ def parse_sov_file(
 
     # --- Merge ---
     if not all_dfs:
-        return pd.DataFrame(), metadata
+        return pd.DataFrame(), pd.DataFrame(), metadata
 
     if len(all_dfs) == 1:
-        return all_dfs[0], metadata
+        return all_dfs[0], all_sources[0], metadata
 
     # Multi-sheet merge: if shared location_id, merge on it; else concat
     if all("location_id" in df.columns for df in all_dfs):
         merged = all_dfs[0]
-        for df in all_dfs[1:]:
+        merged_src = all_sources[0]
+        for df, df_src in zip(all_dfs[1:], all_sources[1:]):
             new_cols = [c for c in df.columns if c not in merged.columns and c != "location_id"]
             if new_cols:
                 merged = merged.merge(
                     df[["location_id"] + new_cols], on="location_id", how="left",
                 )
+                merged_src = merged_src.merge(
+                    df_src[["location_id"] + new_cols], on="location_id", how="left",
+                )
         logger.info("Merged %d sheets on location_id → %d rows", len(all_dfs), len(merged))
-        return merged, metadata
+        return merged, merged_src, metadata
 
     result = pd.concat(all_dfs, ignore_index=True)
+    result_src = pd.concat(all_sources, ignore_index=True)
     logger.info("Concatenated %d sheets → %d rows", len(all_dfs), len(result))
-    return result, metadata
+    return result, result_src, metadata
 
 
 def _log_analysis(analysis: Dict[str, Any], sheet_idx: int = 0) -> None:

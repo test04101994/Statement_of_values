@@ -14,40 +14,93 @@ bedrock:
   max_tokens: 4096
 
 # --- Sheet Selection ---
-# Specify which sheet(s) to parse. Accepts indices (0, 1, ...) or sheet names.
-# If null → LLM auto-detects the sheet most likely to contain property/location data.
-# Examples:
-#   sheets: [0]
-#   sheets: ["Locations"]
-#   sheets: [0, 2]
-#   sheets: ["SOV Data", "Building Details"]
+# If null → LLM auto-detects the best sheet.
 sheets: null
 
 # --- Normalized SOV Fields ---
-# Each key becomes an output column. The description tells the LLM what to look for.
-# To add a new column: just add a line here. No code changes needed.
+# Each field has a description (for LLM mapping) and a type (for validation).
+# Supported types: text, amount, integer, year, coordinate, boolean
+#
+# Validation nulls invalid CELLS, not entire rows.
+#   amount    — strips $, commas, %, accounting parens → float. Nulls non-numeric.
+#   integer   — whole number. Nulls non-numeric.
+#   year      — 4-digit year 1900–2099. Nulls out-of-range.
+#   coordinate — float ±180. Nulls out-of-range.
+#   boolean   — normalizes yes/no/true/false/partial. Nulls unrecognizable.
+#   text      — strips whitespace, nulls empty/NA-like values.
+#
+# To add a new column: add a field entry here. No code changes needed.
+
 fields:
-  location_id: Unique location or risk number
-  location_name: Name or description of the property
-  address: Street address
-  city: City
-  state: State or province
-  zip: ZIP or postal code
-  country: Country
-  occupancy: Occupancy class or use type
-  construction: Construction type
-  year_built: Year the building was constructed
-  num_stories: Number of floors or stories
-  square_footage: Floor area in square feet
-  building_value: Insured value of the building structure
-  contents_value: Insured value of contents or equipment
-  bi_value: Business interruption value
-  other_value: Other insured values
-  tiv: Total Insured Value
-  flood_zone: FEMA flood zone
-  earthquake_zone: Earthquake zone
-  sprinklered: Whether property is sprinklered
-  policy_limit: Coverage or policy limit
-  deductible: Deductible amount
-  latitude: Latitude coordinate
-  longitude: Longitude coordinate
+  location_id:
+    desc: Unique location or risk number
+    type: text
+  location_name:
+    desc: Name or description of the property
+    type: text
+  address:
+    desc: Street address
+    type: text
+  city:
+    desc: City
+    type: text
+  state:
+    desc: State or province
+    type: text
+  zip:
+    desc: ZIP or postal code
+    type: text
+  country:
+    desc: Country
+    type: text
+  occupancy:
+    desc: Occupancy class or use type
+    type: text
+  construction:
+    desc: Construction type
+    type: text
+  year_built:
+    desc: Year the building was constructed
+    type: year
+  num_stories:
+    desc: Number of floors or stories
+    type: integer
+  square_footage:
+    desc: Floor area in square feet
+    type: amount
+  building_value:
+    desc: Insured value of the building structure
+    type: amount
+  contents_value:
+    desc: Insured value of contents or equipment
+    type: amount
+  bi_value:
+    desc: Business interruption value
+    type: amount
+  other_value:
+    desc: Other insured values
+    type: amount
+  tiv:
+    desc: Total Insured Value
+    type: amount
+  flood_zone:
+    desc: FEMA flood zone
+    type: text
+  earthquake_zone:
+    desc: Earthquake zone
+    type: text
+  sprinklered:
+    desc: Whether property is sprinklered
+    type: boolean
+  policy_limit:
+    desc: Coverage or policy limit
+    type: amount
+  deductible:
+    desc: Deductible amount
+    type: amount
+  latitude:
+    desc: Latitude coordinate
+    type: coordinate
+  longitude:
+    desc: Longitude coordinate
+    type: coordinate

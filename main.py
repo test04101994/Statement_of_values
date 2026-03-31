@@ -17,6 +17,8 @@ import sys
 import warnings
 from pathlib import Path
 
+import pandas as pd
+
 from sov.engine import configure_logging, parse_sov_file
 
 warnings.filterwarnings("ignore")
@@ -63,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         parts = [s.strip() for s in args.sheets.split(",")]
         overrides["sheets"] = [int(s) if s.isdigit() else s for s in parts]
 
-    df, metadata = parse_sov_file(
+    df, df_sources, metadata = parse_sov_file(
         filepath,
         config_path=config_path,
         config_overrides=overrides or None,
@@ -75,8 +77,10 @@ def main(argv: list[str] | None = None) -> None:
     base = filepath.rsplit(".", 1)[0]
 
     out_xlsx = base + "_cleaned.xlsx"
-    df.to_excel(out_xlsx, index=False)
-    logger.info("Saved cleaned data : %s", out_xlsx)
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        df_sources.to_excel(writer, sheet_name="Source References", index=False)
+    logger.info("Saved cleaned data : %s (2 sheets: Cleaned Data + Source References)", out_xlsx)
 
     out_json = base + "_llm_responses.json"
     with open(out_json, "w", encoding="utf-8") as f:

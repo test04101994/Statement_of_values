@@ -61,34 +61,42 @@ for cell in ws_2025[3]:
     cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
 data_2025 = [
+    # Row 1 — clean data
     [1, "HQ Office Tower", "100 Main St", "New York", "NY", "10001",
      "USA", "Office", "Steel Frame", 2005, 25, 500000,
      48000000, 13000000, 8500000, 500000, 70000000,
      "X", "3", "Yes", 70000000, 50000, 40.7128, -74.0060],
+    # Row 2 — currency-formatted strings ($ and commas)
     [2, "Distribution Center", "500 Industrial Blvd", "Chicago", "IL", "60601",
-     "USA", "Warehouse", "Pre-Eng Metal", 2010, 2, 250000,
-     20000000, 5500000, 3200000, 0, 28700000,
-     "A", "1", "Yes", 28700000, 25000, 41.8781, -87.6298],
+     "USA", "Warehouse", "Pre-Eng Metal", 2010, 2, "250,000",
+     "$20,000,000", "$5,500,000", "$3,200,000", "$0", "$28,700,000",
+     "A", "1", "Y", 28700000, 25000, 41.8781, -87.6298],
+    # Row 3 — clean data with Partial sprinkler
     [3, "R&D Campus Bldg A", "1200 Innovation Dr", "San Jose", "CA", "95110",
      "USA", "Laboratory", "Reinforced Concrete", 2018, 4, 120000,
      35000000, 18000000, 12000000, 2000000, 67000000,
      "X", "5", "Partial", 67000000, 100000, 37.3382, -121.8863],
+    # Row 4 — dirty: "TBD" in building_value, "circa 1995" in year_built, bad coordinate
     [4, "Retail Storefront", "88 Commerce Ave", "Dallas", "TX", "75201",
-     "USA", "Retail", "Masonry", 1995, 1, 8000,
-     1200000, 800000, 400000, 0, 2400000,
-     "C", "0", "No", 2400000, 10000, 32.7767, -96.7970],
+     "USA", "Retail", "Masonry", "circa 1995", "one", 8000,
+     "TBD", 800000, 400000, "N/A", 2400000,
+     "C", "0", "No", 2400000, 10000, 32.7767, 999.0],
+    # Row 5 — accounting negative in other_value
     [5, "Data Center", "2000 Server Rd", "Ashburn", "VA", "20147",
      "USA", "Data Center", "Steel Frame", 2020, 3, 60000,
-     55000000, 40000000, 25000000, 5000000, 125000000,
-     "X", "2", "Yes", 100000000, 250000, 39.0438, -77.4874],
+     55000000, 40000000, 25000000, "(5000)", 125000000,
+     "X", "2", "true", 100000000, 250000, 39.0438, -77.4874],
+    # Row 6 — clean
     [6, "Manufacturing Plant", "750 Factory Ln", "Detroit", "MI", "48201",
      "USA", "Manufacturing", "Pre-Eng Metal", 2001, 2, 180000,
      22000000, 15000000, 8000000, 1000000, 46000000,
-     "B", "1", "Yes", 46000000, 75000, 42.3314, -83.0458],
+     "B", "1", "1", 46000000, 75000, 42.3314, -83.0458],
+    # Row 7 — "None" and "-" in values
     [7, "Regional Office", "300 Park Ave", "Atlanta", "GA", "30301",
      "USA", "Office", "Masonry", 2012, 8, 45000,
-     9000000, 3000000, 2000000, 0, 14000000,
-     "X", "0", "No", 14000000, 25000, 33.7490, -84.3880],
+     9000000, 3000000, "-", None, 14000000,
+     "X", "0", "n", 14000000, 25000, 33.7490, -84.3880],
+    # Row 8 — clean
     [8, "Cold Storage Facility", "1500 Frost Way", "Minneapolis", "MN", "55401",
      "USA", "Cold Storage", "Insulated Metal Panel", 2015, 1, 95000,
      16000000, 8000000, 6000000, 500000, 30500000,
@@ -97,6 +105,14 @@ data_2025 = [
 
 for row in data_2025:
     ws_2025.append(row)
+
+# Apply currency number formatting to building_value column (col M = 13) for row 1
+# This tests that _extract_cell_value reads the raw number, not "$48,000,000"
+from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1
+for r in range(4, 12):  # data rows 4-11
+    for c in [13, 14, 15, 16, 17, 21, 22]:  # value columns
+        cell = ws_2025.cell(row=r, column=c)
+        cell.number_format = '$#,##0'
 
 # Add a totals row (should be skipped)
 ws_2025.append([])

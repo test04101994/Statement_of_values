@@ -4,7 +4,8 @@
       "Bash(source .venv/bin/activate)",
       "Bash(python create_sample.py)",
       "Bash(pip install:*)",
-      "Bash(python main.py sample_sov.xlsx)"
+      "Bash(python main.py sample_sov.xlsx)",
+      "Bash(python -c \":*)"
     ]
   }
 }
