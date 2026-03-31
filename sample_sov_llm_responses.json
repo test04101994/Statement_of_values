@@ -1,0 +1,64 @@
+{
+  "sheet_indices": [
+    2
+  ],
+  "analyses": [
+    {
+      "header_row": 2,
+      "data_start_row": 3,
+      "data_end_row": 10,
+      "multi_year": false,
+      "selected_year": null,
+      "all_years_found": [],
+      "column_mapping": {
+        "0": "location_id",
+        "1": "location_name",
+        "2": "address",
+        "3": "city",
+        "4": "state",
+        "5": "zip",
+        "6": "country",
+        "7": "occupancy",
+        "8": "construction",
+        "9": "year_built",
+        "10": "num_stories",
+        "11": "square_footage",
+        "12": "building_value",
+        "13": "contents_value",
+        "14": "bi_value",
+        "15": "other_value",
+        "16": "tiv",
+        "17": "flood_zone",
+        "18": "earthquake_zone",
+        "19": "sprinklered",
+        "20": "policy_limit",
+        "21": "deductible",
+        "22": "latitude",
+        "23": "longitude"
+      },
+      "skip_row_patterns": [
+        "TOTAL"
+      ],
+      "derived_columns": [],
+      "sheet_notes": "The file contains a single year of data with all required columns directly mappable to the schema."
+    }
+  ],
+  "llm_responses": [
+    {
+      "step": "sheet_detection",
+      "model_id": "us.amazon.nova-pro-v1:0",
+      "input_tokens": 1123,
+      "output_tokens": 38,
+      "stop_reason": "end_turn",
+      "raw_response": "{\"sheet\": 2, \"reason\": \"Sheet 'SOV 2025' is the most recent year with detailed SOV data including addresses and insured values.\"}"
+    },
+    {
+      "step": "sheet_2_analysis",
+      "model_id": "us.amazon.nova-pro-v1:0",
+      "input_tokens": 2805,
+      "output_tokens": 326,
+      "stop_reason": "end_turn",
+      "raw_response": "{\n  \"header_row\": 2,\n  \"data_start_row\": 3,\n  \"data_end_row\": 10,\n  \"multi_year\": false,\n  \"selected_year\": null,\n  \"all_years_found\": [],\n  \"column_mapping\": {\n    \"0\": \"location_id\",\n    \"1\": \"location_name\",\n    \"2\": \"address\",\n    \"3\": \"city\",\n    \"4\": \"state\",\n    \"5\": \"zip\",\n    \"6\": \"country\",\n    \"7\": \"occupancy\",\n    \"8\": \"construction\",\n    \"9\": \"year_built\",\n    \"10\": \"num_stories\",\n    \"11\": \"square_footage\",\n    \"12\": \"building_value\",\n    \"13\": \"contents_value\",\n    \"14\": \"bi_value\",\n    \"15\": \"other_value\",\n    \"16\": \"tiv\",\n    \"17\": \"flood_zone\",\n    \"18\": \"earthquake_zone\",\n    \"19\": \"sprinklered\",\n    \"20\": \"policy_limit\",\n    \"21\": \"deductible\",\n    \"22\": \"latitude\",\n    \"23\": \"longitude\"\n  },\n  \"skip_row_patterns\": [\"TOTAL\"],\n  \"derived_columns\": [],\n  \"sheet_notes\": \"The file contains a single year of data with all required columns directly mappable to the schema.\"\n}"
+    }
+  ]
+}

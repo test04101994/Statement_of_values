@@ -1,0 +1,53 @@
+# =============================================================================
+# SOV Parser Configuration
+# =============================================================================
+
+# --- AWS Bedrock ---
+bedrock:
+  aws_region: us-east-1
+  model_id: us.amazon.nova-pro-v1:0
+  # Application inference profile ARN — set for production.
+  # Format: arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<profile-id>
+  inference_profile_arn: null
+  # Named AWS CLI profile (null = default credential chain)
+  aws_profile: null
+  max_tokens: 4096
+
+# --- Sheet Selection ---
+# Specify which sheet(s) to parse. Accepts indices (0, 1, ...) or sheet names.
+# If null → LLM auto-detects the sheet most likely to contain property/location data.
+# Examples:
+#   sheets: [0]
+#   sheets: ["Locations"]
+#   sheets: [0, 2]
+#   sheets: ["SOV Data", "Building Details"]
+sheets: null
+
+# --- Normalized SOV Fields ---
+# Each key becomes an output column. The description tells the LLM what to look for.
+# To add a new column: just add a line here. No code changes needed.
+fields:
+  location_id: Unique location or risk number
+  location_name: Name or description of the property
+  address: Street address
+  city: City
+  state: State or province
+  zip: ZIP or postal code
+  country: Country
+  occupancy: Occupancy class or use type
+  construction: Construction type
+  year_built: Year the building was constructed
+  num_stories: Number of floors or stories
+  square_footage: Floor area in square feet
+  building_value: Insured value of the building structure
+  contents_value: Insured value of contents or equipment
+  bi_value: Business interruption value
+  other_value: Other insured values
+  tiv: Total Insured Value
+  flood_zone: FEMA flood zone
+  earthquake_zone: Earthquake zone
+  sprinklered: Whether property is sprinklered
+  policy_limit: Coverage or policy limit
+  deductible: Deductible amount
+  latitude: Latitude coordinate
+  longitude: Longitude coordinate
