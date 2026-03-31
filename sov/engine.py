@@ -987,6 +987,11 @@ NEVER put the same field in both column_mapping and derived_columns.
   "Expiring Rent", "Expiring Sum Insured", "Exp Contents", "Previous Year Limit"
 - Only map CURRENT / RENEWAL / PROPOSED year columns.
 
+## DO NOT DERIVE ADDRESS SUB-FIELDS:
+- NEVER create derived_columns for town, state, zip_code, or country.
+- These are extracted automatically from the address column by a separate process.
+- Only map them if they have their own dedicated column in the spreadsheet.
+
 ## GENERAL RULES:
 - column_mapping keys are 0-based column indices as strings ("0", "1", "2" ...)
 - Only include columns that map to a schema key
@@ -1045,17 +1050,23 @@ def analyse_sheet_with_prematched(
             f'  col {idx}: "{text}"' for idx, text in unmatched
         )
 
-    # Detect which address sub-fields are missing
     matched_fields = set(pre_matched.values())
-    address_col_idx = None
-    for idx_str, field in pre_matched.items():
-        if field == "address":
-            address_col_idx = idx_str
-            break
+    if "address" in matched_fields:
+        address_derivation_hint = """
 
-    # Address sub-field extraction is handled by Python (usaddress + regex)
-    # in _fill_address_fields() — no LLM derivation needed for town/state/zip/country.
-    address_derivation_hint = ""
+## ADDRESS SUB-FIELDS (town, state, zip_code, country):
+The spreadsheet has a column already mapped to "address". Do NOT list town, state,
+zip_code, or country in derived_columns or additional_column_mapping unless the file
+has a **separate** column for that field. Those components are parsed from the full
+address string automatically after extraction — you would only duplicate or confuse the pipeline."""
+    else:
+        address_derivation_hint = ""
+
+    derived_column_rules = """
+- Every derived_columns entry MUST be a JSON object with non-empty "type": exactly one of
+  "sum", "concat", "split", "regex_extract". Never omit "type" and never use "".
+- If you have no derivations, use "derived_columns": [].
+"""
 
     prompt = f"""You are an expert insurance data analyst. I have a property SOV Excel sheet.
 I have ALREADY matched most columns. I need you to:
@@ -1071,6 +1082,7 @@ I have ALREADY matched most columns. I need you to:
 {pre_match_desc}
 {unmatched_desc}
 {address_derivation_hint}
+{derived_column_rules}
 
 ## RAW EXCEL ROWS:
 {preview_text}
@@ -1094,8 +1106,8 @@ RESPOND WITH THIS EXACT JSON STRUCTURE:
 RULES:
 - additional_column_mapping should ONLY contain mappings for unmatched columns.
 - Do NOT re-map pre-matched columns.
-- derived_columns: use when a schema field needs computation from existing columns
-  (sum, concat, split, regex_extract). This includes extracting town/state/zip from address.
+- derived_columns: only when a schema value must be computed from raw columns (sum, concat,
+  split, regex_extract). Each object MUST include a valid "type" as above.
 - NEVER map columns with "Expiring", "Exp", "Prior Year", "Previous Year", "Outgoing" in the header.
   These are old/expiring values — skip them completely.
 - YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
@@ -1121,9 +1133,22 @@ RULES:
         "all_years_found": result.get("all_years_found", []),
         "column_mapping": final_mapping,
         "skip_row_patterns": result.get("skip_row_patterns", []),
-        "derived_columns": result.get("derived_columns", []),
+        "derived_columns": [],
         "sheet_notes": result.get("sheet_notes", ""),
     }
+
+    # Filter out any derivation rules for address sub-fields — handled by Python
+    _addr_block = {"town", "state", "zip_code", "country"}
+    for d in result.get("derived_columns", []):
+        target = d.get("target", "")
+        dtype = d.get("type", "")
+        if target in _addr_block:
+            logger.info("Blocked LLM derivation for %r (handled by address parser)", target)
+            continue
+        if not dtype:
+            logger.warning("Skipped derivation with empty type for %r", target)
+            continue
+        analysis["derived_columns"].append(d)
 
     return analysis, llm_resp
 
@@ -1170,19 +1195,74 @@ def _validate_year_columns(
 # Derivations
 # ---------------------------------------------------------------------------
 
+# Targets that are normally filled from a mapped ``address`` column by
+# :func:`_fill_address_fields` when the sheet has no dedicated column.
+_ADDRESS_DERIVATION_SKIP_TARGETS = frozenset(
+    {"town", "city", "state", "zip_code", "country", "zip"},
+)
+
+
+def _infer_derivation_type(rule: Dict[str, Any]) -> str:
+    """Normalize ``type`` and infer it from ``params`` when the model omits it."""
+    raw = rule.get("type")
+    if raw is not None:
+        s = str(raw).strip().lower()
+        if s and s not in ("none", "null", "n/a", "-"):
+            return s
+    params = rule.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if params.get("pattern"):
+        return "regex_extract"
+    if "delimiter" in params or "part_index" in params:
+        return "split"
+    if params.get("separator") is not None:
+        return "concat"
+    return ""
+
 
 def _apply_derivations(
     df_raw: pd.DataFrame,
     rules: List[Dict[str, Any]],
+    *,
+    mapped_schema_fields: Optional[set[str]] = None,
 ) -> Dict[str, pd.Series]:
-    """Compute derived columns (sum, concat, split, regex_extract)."""
+    """Compute derived columns (sum, concat, split, regex_extract).
+
+    Parameters
+    ----------
+    df_raw
+        DataFrame keyed by string column indices.
+    rules
+        LLM ``derived_columns`` entries.
+    mapped_schema_fields
+        Schema field names produced by direct ``column_mapping`` (used to detect
+        when address sub-fields can be skipped if ``type`` is empty).
+    """
     derived: dict[str, pd.Series] = {}
+    mapped_schema_fields = mapped_schema_fields or set()
+    address_mapped = "address" in mapped_schema_fields
 
     for rule in rules:
         target = rule.get("target", "")
-        dtype = rule.get("type", "")
+        dtype = _infer_derivation_type(rule)
         src = rule.get("source_cols", [])
         params = rule.get("params", {})
+
+        if not dtype:
+            if address_mapped and target in _ADDRESS_DERIVATION_SKIP_TARGETS:
+                logger.debug(
+                    "Skipping derivation for %r with empty/missing type; "
+                    "town/state/zip will be filled from address where possible",
+                    target,
+                )
+                continue
+            logger.warning(
+                "Unknown derivation type %r for %r (expected sum|concat|split|regex_extract)",
+                rule.get("type", ""),
+                target,
+            )
+            continue
 
         missing = [c for c in src if c not in df_raw.columns]
         if missing:
@@ -1230,7 +1310,11 @@ def _apply_derivations(
                 )
 
             else:
-                logger.warning("Unknown derivation type %r for %r", dtype, target)
+                logger.warning(
+                    "Unknown derivation type %r for %r (expected sum|concat|split|regex_extract)",
+                    dtype,
+                    target,
+                )
                 continue
 
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -1570,8 +1654,18 @@ def build_clean_dataframe(
                 f"{sheet_prefix}{col_letter}{excel_row}" for excel_row in source_rows
             ]
 
-    # Derived columns
-    derived = _apply_derivations(df_raw, derived_rules) if derived_rules else {}
+    # Derived columns (pass mapped fields so empty-type town/state rules are skipped
+    # when address is mapped — _fill_address_fields handles those cases)
+    mapped_schema_fields = set(col_mapping.values())
+    derived = (
+        _apply_derivations(
+            df_raw,
+            derived_rules,
+            mapped_schema_fields=mapped_schema_fields,
+        )
+        if derived_rules
+        else {}
+    )
 
     # Build source references for derived columns
     derived_refs: dict[str, list[str]] = {}
