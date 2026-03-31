@@ -74,8 +74,8 @@ def _append_sheets_to_source(
     wb.save(source_path)
 
     with pd.ExcelWriter(source_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df.to_excel(writer, sheet_name="Cleaned Data", index=False)
-        df_sources.to_excel(writer, sheet_name="Source References", index=False)
+        df.fillna("").to_excel(writer, sheet_name="Cleaned Data", index=False)
+        df_sources.fillna("").to_excel(writer, sheet_name="Source References", index=False)
 
 
 def process_file(

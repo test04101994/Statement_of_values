@@ -1045,6 +1045,18 @@ def analyse_sheet_with_prematched(
             f'  col {idx}: "{text}"' for idx, text in unmatched
         )
 
+    # Detect which address sub-fields are missing
+    matched_fields = set(pre_matched.values())
+    address_col_idx = None
+    for idx_str, field in pre_matched.items():
+        if field == "address":
+            address_col_idx = idx_str
+            break
+
+    # Address sub-field extraction is handled by Python (usaddress + regex)
+    # in _fill_address_fields() — no LLM derivation needed for town/state/zip/country.
+    address_derivation_hint = ""
+
     prompt = f"""You are an expert insurance data analyst. I have a property SOV Excel sheet.
 I have ALREADY matched most columns. I need you to:
 1. Determine the structure (header_row, data_start_row, data_end_row)
@@ -1058,6 +1070,7 @@ I have ALREADY matched most columns. I need you to:
 ## PRE-MATCHED COLUMNS (already resolved — do NOT change these):
 {pre_match_desc}
 {unmatched_desc}
+{address_derivation_hint}
 
 ## RAW EXCEL ROWS:
 {preview_text}
@@ -1081,7 +1094,8 @@ RESPOND WITH THIS EXACT JSON STRUCTURE:
 RULES:
 - additional_column_mapping should ONLY contain mappings for unmatched columns.
 - Do NOT re-map pre-matched columns.
-- derived_columns: only if a schema field needs computation from multiple columns.
+- derived_columns: use when a schema field needs computation from existing columns
+  (sum, concat, split, regex_extract). This includes extracting town/state/zip from address.
 - NEVER map columns with "Expiring", "Exp", "Prior Year", "Previous Year", "Outgoing" in the header.
   These are old/expiring values — skip them completely.
 - YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
@@ -1310,6 +1324,177 @@ def _apply_field_types(
 
 
 # ---------------------------------------------------------------------------
+# Address parsing (free, no LLM)
+# ---------------------------------------------------------------------------
+
+# Address sub-fields that can be derived from a full address string.
+_ADDR_SUB_FIELDS = ("town", "state", "zip_code", "country")
+
+
+def _parse_address_usaddress(address: str) -> Dict[str, str]:
+    """Parse a US-style address using the usaddress library."""
+    try:
+        import usaddress
+        tagged, _ = usaddress.tag(address)
+        result: dict[str, str] = {}
+
+        # Town / city
+        city = tagged.get("PlaceName", "")
+        if city:
+            result["town"] = city.strip().rstrip(",")
+
+        # State
+        state = tagged.get("StateName", "")
+        if state:
+            result["state"] = state.strip().rstrip(",")
+
+        # Zip
+        zipcode = tagged.get("ZipCode", "")
+        if zipcode:
+            result["zip_code"] = zipcode.strip()
+
+        return result
+    except Exception:
+        return {}
+
+
+def _parse_addresses_llm(
+    addresses: List[str],
+    fields_needed: List[str],
+    bedrock_cfg: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Use LLM to parse addresses into components. Fallback when usaddress can't handle them.
+
+    Sends all addresses in one batch call to minimize cost.
+    """
+    addr_list = "\n".join(f"  {i}: \"{a}\"" for i, a in enumerate(addresses))
+    fields_str = ", ".join(fields_needed)
+
+    prompt = f"""Parse each address below into its components. Extract ONLY these fields: {fields_str}
+
+Addresses:
+{addr_list}
+
+Return ONLY a JSON array with one object per address, in the same order:
+[
+  {{"town": "...", "state": "...", "zip_code": "...", "country": "..."}},
+  ...
+]
+
+Rules:
+- town = city or town name
+- state = state, province, or county
+- zip_code = postal code / ZIP code / postcode
+- country = country name or code
+- If a field cannot be determined, use null
+- Handle US, UK, Canadian, European, Asian, and all international address formats
+- YOUR ENTIRE RESPONSE MUST BE A VALID JSON ARRAY. No markdown. No explanation.
+"""
+
+    llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=4096)
+    raw = llm_resp["raw_response"]
+
+    try:
+        results = json.loads(raw)
+        if isinstance(results, list):
+            return results
+    except json.JSONDecodeError:
+        logger.warning("LLM address parsing returned invalid JSON")
+
+    return [{} for _ in addresses]
+
+
+def _fill_address_fields(
+    df: pd.DataFrame,
+    bedrock_cfg: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    """If address exists but town/state/zip_code/country are empty, parse them.
+
+    Tier 1: usaddress library (free, handles US/UK addresses)
+    Tier 2: LLM batch call (fallback for addresses usaddress can't parse)
+    """
+    if "address" not in df.columns:
+        return df
+
+    # Check which sub-fields need filling
+    fields_to_fill = [
+        f for f in _ADDR_SUB_FIELDS
+        if f in df.columns and df[f].isna().all()
+    ]
+    if not fields_to_fill:
+        return df
+
+    logger.info("Parsing addresses to fill: %s", ", ".join(fields_to_fill))
+
+    # Try usaddress first
+    has_usaddress = True
+    try:
+        import usaddress  # noqa: F401
+    except ImportError:
+        has_usaddress = False
+
+    # Track which rows usaddress couldn't fully resolve
+    llm_needed_indices: list[int] = []
+    llm_needed_addresses: list[str] = []
+    llm_needed_fields: dict[int, list[str]] = {}  # idx → fields still missing
+
+    for idx, row in df.iterrows():
+        addr = row.get("address")
+        if pd.isna(addr) or not str(addr).strip():
+            continue
+
+        addr_str = str(addr).strip()
+        parsed = _parse_address_usaddress(addr_str) if has_usaddress else {}
+
+        # Apply what usaddress found
+        for f in fields_to_fill:
+            if f in parsed and parsed[f]:
+                df.at[idx, f] = parsed[f]
+
+        # Check what's still missing for this row
+        still_missing = [
+            f for f in fields_to_fill
+            if f not in parsed or not parsed.get(f)
+        ]
+        if still_missing:
+            llm_needed_indices.append(idx)
+            llm_needed_addresses.append(addr_str)
+            llm_needed_fields[idx] = still_missing
+
+    usaddress_filled = len(df) - len(llm_needed_indices)
+    if usaddress_filled > 0:
+        logger.info("usaddress parsed %d/%d addresses", usaddress_filled, len(df))
+
+    # LLM fallback for remaining addresses
+    if llm_needed_addresses and bedrock_cfg:
+        logger.info(
+            "Calling LLM to parse %d address(es) that usaddress couldn't fully resolve",
+            len(llm_needed_addresses),
+        )
+        llm_results = _parse_addresses_llm(
+            llm_needed_addresses, fields_to_fill, bedrock_cfg,
+        )
+
+        for i, idx in enumerate(llm_needed_indices):
+            if i >= len(llm_results):
+                break
+            parsed = llm_results[i]
+            if not isinstance(parsed, dict):
+                continue
+            for f in llm_needed_fields.get(idx, []):
+                val = parsed.get(f)
+                if val and str(val).strip().lower() not in ("null", "none", ""):
+                    df.at[idx, f] = str(val).strip()
+
+        logger.info("LLM parsed %d remaining addresses", len(llm_needed_addresses))
+
+    filled = {f: df[f].notna().sum() for f in fields_to_fill}
+    logger.info("Address fields filled: %s", filled)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # DataFrame builder
 # ---------------------------------------------------------------------------
 
@@ -1320,6 +1505,7 @@ def build_clean_dataframe(
     schema: Dict[str, str],
     field_types: Optional[Dict[str, str]] = None,
     sheet_name: Optional[str] = None,
+    bedrock_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Apply LLM analysis to raw rows → (clean_df, source_ref_df).
 
@@ -1423,6 +1609,24 @@ def build_clean_dataframe(
             df[col] = (
                 df[col].astype(str).str.strip().replace({"None": pd.NA, "nan": pd.NA})
             )
+
+    # Fill missing town/state/zip/country from address
+    # Tier 1: usaddress (free), Tier 2: LLM fallback
+    df = _fill_address_fields(df, bedrock_cfg=bedrock_cfg)
+
+    # Drop rows where address AND all its constituents are empty — address is the anchor
+    addr_fields = [f for f in ("address", "town", "state", "zip_code", "country") if f in df.columns]
+    if addr_fields:
+        before = len(df)
+        mask = df[addr_fields].apply(
+            lambda row: row.notna().any() and any(str(v).strip() not in ("", "None", "nan") for v in row if pd.notna(v)),
+            axis=1,
+        )
+        df = df.loc[mask].reset_index(drop=True)
+        df_sources = df_sources.loc[mask].reset_index(drop=True)
+        dropped = before - len(df)
+        if dropped:
+            logger.info("Dropped %d row(s) with no address data", dropped)
 
     return df, df_sources
 
@@ -1578,7 +1782,8 @@ def parse_sov_file(
                 logger.info("Removed %d stale year column(s)", dropped)
 
         df, df_src = build_clean_dataframe(
-            rows, analysis, schema, field_types, sheet_name=sname
+            rows, analysis, schema, field_types,
+            sheet_name=sname, bedrock_cfg=bedrock_cfg,
         )
         if not df.empty:
             all_dfs.append(df)
