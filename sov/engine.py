@@ -1488,75 +1488,95 @@ Rules:
     return [{} for _ in addresses]
 
 
+def _is_cell_empty(val: object) -> bool:
+    """Check if a cell value is empty/NA/null."""
+    if val is None or pd.isna(val):
+        return True
+    s = str(val).strip().lower()
+    return s in ("", "none", "nan", "<na>", "na", "null", "n/a", "-")
+
+
 def _fill_address_fields(
     df: pd.DataFrame,
     bedrock_cfg: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    """If address exists but town/state/zip_code/country are empty, parse them.
+    """For every row: if address has a value but any of town/state/zip_code/country
+    is empty, attempt to fill it from the address.
+
+    Per-ROW check, not per-column. Even if some rows have town filled,
+    other rows with empty town will still be filled from their address.
 
     Tier 1: usaddress library (free, handles US/UK addresses)
-    Tier 2: LLM batch call (fallback for addresses usaddress can't parse)
+    Tier 2: LLM batch call (fallback for what usaddress can't parse)
     """
     if "address" not in df.columns:
         return df
 
-    # Check which sub-fields need filling
-    fields_to_fill = [
-        f for f in _ADDR_SUB_FIELDS
-        if f in df.columns and df[f].isna().all()
-    ]
-    if not fields_to_fill:
+    # Which sub-fields exist in the DataFrame
+    available_fields = [f for f in _ADDR_SUB_FIELDS if f in df.columns]
+    if not available_fields:
         return df
 
-    logger.info("Parsing addresses to fill: %s", ", ".join(fields_to_fill))
-
-    # Try usaddress first
     has_usaddress = True
     try:
         import usaddress  # noqa: F401
     except ImportError:
         has_usaddress = False
 
-    # Track which rows usaddress couldn't fully resolve
     llm_needed_indices: list[int] = []
     llm_needed_addresses: list[str] = []
-    llm_needed_fields: dict[int, list[str]] = {}  # idx → fields still missing
+    llm_needed_fields: dict[int, list[str]] = {}
+    rows_attempted = 0
 
     for idx, row in df.iterrows():
         addr = row.get("address")
-        if pd.isna(addr) or not str(addr).strip():
+        if _is_cell_empty(addr):
             continue
 
+        # Find which sub-fields are empty for THIS row
+        missing_in_row = [f for f in available_fields if _is_cell_empty(row.get(f))]
+        if not missing_in_row:
+            continue  # this row already has all sub-fields filled
+
+        rows_attempted += 1
         addr_str = str(addr).strip()
+
+        # Tier 1: usaddress
         parsed = _parse_address_usaddress(addr_str) if has_usaddress else {}
 
-        # Apply what usaddress found
-        for f in fields_to_fill:
+        # Apply what usaddress found to empty cells only
+        still_missing = []
+        for f in missing_in_row:
             if f in parsed and parsed[f]:
                 df.at[idx, f] = parsed[f]
+            else:
+                still_missing.append(f)
 
-        # Check what's still missing for this row
-        still_missing = [
-            f for f in fields_to_fill
-            if f not in parsed or not parsed.get(f)
-        ]
+        # Track rows that still have gaps
         if still_missing:
             llm_needed_indices.append(idx)
             llm_needed_addresses.append(addr_str)
             llm_needed_fields[idx] = still_missing
 
-    usaddress_filled = len(df) - len(llm_needed_indices)
-    if usaddress_filled > 0:
-        logger.info("usaddress parsed %d/%d addresses", usaddress_filled, len(df))
+    if rows_attempted == 0:
+        return df
 
-    # LLM fallback for remaining addresses
+    usaddress_only = rows_attempted - len(llm_needed_indices)
+    logger.info(
+        "Address parsing: %d rows attempted, %d fully resolved by usaddress, %d need LLM",
+        rows_attempted, usaddress_only, len(llm_needed_indices),
+    )
+
+    # Tier 2: LLM fallback for remaining
     if llm_needed_addresses and bedrock_cfg:
+        # Collect unique fields needed across all rows
+        all_fields_needed = sorted(set(f for fields in llm_needed_fields.values() for f in fields))
         logger.info(
-            "Calling LLM to parse %d address(es) that usaddress couldn't fully resolve",
-            len(llm_needed_addresses),
+            "Calling LLM to parse %d address(es) for fields: %s",
+            len(llm_needed_addresses), ", ".join(all_fields_needed),
         )
         llm_results = _parse_addresses_llm(
-            llm_needed_addresses, fields_to_fill, bedrock_cfg,
+            llm_needed_addresses, all_fields_needed, bedrock_cfg,
         )
 
         for i, idx in enumerate(llm_needed_indices):
@@ -1570,9 +1590,9 @@ def _fill_address_fields(
                 if val and str(val).strip().lower() not in ("null", "none", ""):
                     df.at[idx, f] = str(val).strip()
 
-        logger.info("LLM parsed %d remaining addresses", len(llm_needed_addresses))
+        logger.info("LLM filled remaining %d addresses", len(llm_needed_addresses))
 
-    filled = {f: df[f].notna().sum() for f in fields_to_fill}
+    filled = {f: df[f].notna().sum() for f in available_fields}
     logger.info("Address fields filled: %s", filled)
 
     return df
