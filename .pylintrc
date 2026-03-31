@@ -1,0 +1,24 @@
+[MAIN]
+py-version = 3.11
+persistent = no
+
+[FORMAT]
+max-line-length = 120
+indent-string = "    "
+
+[DESIGN]
+max-args = 10
+max-positional-arguments = 10
+max-locals = 60
+max-returns = 20
+max-branches = 25
+max-statements = 100
+max-module-lines = 2500
+
+[MESSAGES CONTROL]
+# Single-file engine is intentionally large until split into subpackages.
+disable =
+    duplicate-code,
+
+[SIMILARITIES]
+min-similarity-lines = 6

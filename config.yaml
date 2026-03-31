@@ -1,106 +1,332 @@
 # =============================================================================
-# SOV Parser Configuration
+# SOV Parser Configuration — Property Line of Business
 # =============================================================================
 
 # --- AWS Bedrock ---
 bedrock:
   aws_region: us-east-1
   model_id: us.amazon.nova-pro-v1:0
-  # Application inference profile ARN — set for production.
-  # Format: arn:aws:bedrock:<region>:<account-id>:application-inference-profile/<profile-id>
   inference_profile_arn: null
-  # Named AWS CLI profile (null = default credential chain)
   aws_profile: null
   max_tokens: 4096
+  embedding_model_id: amazon.titan-embed-text-v2:0
 
 # --- Sheet Selection ---
-# If null → LLM auto-detects the best sheet.
 sheets: null
 
-# --- Normalized SOV Fields ---
-# Each field has a description (for LLM mapping) and a type (for validation).
-# Supported types: text, amount, integer, year, coordinate, boolean
-#
-# Validation nulls invalid CELLS, not entire rows.
-#   amount    — strips $, commas, %, accounting parens → float. Nulls non-numeric.
-#   integer   — whole number. Nulls non-numeric.
-#   year      — 4-digit year 1900–2099. Nulls out-of-range.
-#   coordinate — float ±180. Nulls out-of-range.
-#   boolean   — normalizes yes/no/true/false/partial. Nulls unrecognizable.
-#   text      — strips whitespace, nulls empty/NA-like values.
-#
-# To add a new column: add a field entry here. No code changes needed.
+# --- Embedding Matching ---
+embedding:
+  similarity_threshold: 0.80
+  candidate_threshold: 0.60
 
+# --- Normalized SOV Fields ---
 fields:
-  location_id:
-    desc: Unique location or risk number
-    type: text
-  location_name:
-    desc: Name or description of the property
-    type: text
+
   address:
-    desc: Street address
+    desc: Full street address of the insured property
     type: text
-  city:
-    desc: City
+    synonyms:
+      - Address
+      - Street Address
+      - Address Line 1
+      - Property Address
+      - Mailing Address
+      - Street
+      - Addr
+      - Address 1
+      - Street Addr
+      - Location Address
+      - Risk Address
+      - Site Address
+      - Insured Address
+      - Premises Address
+
+  town:
+    desc: Town or city name where the property is located
     type: text
+    synonyms:
+      - Town
+      - City
+      - City Name
+      - Municipality
+      - Town Name
+      - City/Town
+      - Town/City
+      - Suburb
+      - Locality
+
   state:
-    desc: State or province
+    desc: State or province where the property is located
     type: text
-  zip:
-    desc: ZIP or postal code
+    synonyms:
+      - State
+      - Province
+      - State/Province
+      - State Code
+      - Region
+      - St
+      - Territory
+
+  zip_code:
+    desc: ZIP code or postal code
     type: text
+    synonyms:
+      - ZIP
+      - Zip Code
+      - ZIP Code
+      - Postal Code
+      - Postcode
+      - Post Code
+      - Zip/Postal
+      - Pin Code
+      - Pincode
+
   country:
-    desc: Country
+    desc: Country where the property is located
     type: text
-  occupancy:
-    desc: Occupancy class or use type
+    synonyms:
+      - Country
+      - Country Code
+      - Nation
+      - Ctry
+      - Country Name
+
+  insured_name:
+    desc: Name of the insured party or policyholder
     type: text
-  construction:
-    desc: Construction type
+    synonyms:
+      - Insured Name
+      - Insured
+      - Named Insured
+      - Policy Holder
+      - Policyholder
+      - Insured Party
+      - Client Name
+      - Customer Name
+      - Account Name
+      - Assured
+      - Name of Insured
+      - Insured's Name
+
+  currency:
+    desc: Currency of the insured values
     type: text
-  year_built:
-    desc: Year the building was constructed
-    type: year
-  num_stories:
-    desc: Number of floors or stories
-    type: integer
-  square_footage:
-    desc: Floor area in square feet
-    type: amount
+    synonyms:
+      - Currency
+      - Currency Code
+      - Ccy
+      - CCY
+      - Curr
+      - Currency Type
+      - Valuation Currency
+      - Policy Currency
+
   building_value:
-    desc: Insured value of the building structure
+    desc: Insured value of the building or structure
     type: amount
-  contents_value:
-    desc: Insured value of contents or equipment
+    synonyms:
+      - Building Value
+      - Bldg Value
+      - Bldg Val
+      - Building Val
+      - Structure Value
+      - Building Replacement Cost
+      - Bldg Replacement
+      - Property Value
+      - Insured Bldg Value
+      - Bldg Repl Cost
+      - Building Amount
+      - Bldg Amt
+      - Building Sum Insured
+      - Bldg SI
+      - Real Property Value
+      - Building Limit
+      - Buildings
+
+  machinery_equipment_value:
+    desc: Insured value of machinery, equipment, and furniture
     type: amount
+    synonyms:
+      - Machinery/Equipment
+      - M&E Value
+      - Machinery Value
+      - Equipment Value
+      - M&E
+      - Machinery & Equipment
+      - Plant & Machinery
+      - Plant and Machinery
+      - P&M
+      - Furniture Value
+      - FF&E
+      - Furniture Fixtures & Equipment
+      - Furniture, Fixtures & Equipment
+      - Equipment & Machinery
+      - Contents Value
+      - Contents Val
+      - Contents
+      - BPP
+      - Business Personal Property
+      - Machinery Equipment and Furniture
+      - Plant Machinery and Equipment
+
+  stock_supplies_value:
+    desc: Insured value of stock, supplies, and inventory
+    type: amount
+    synonyms:
+      - Stock Value
+      - Stock & Supplies
+      - Stock and Supplies
+      - Inventory Value
+      - Inventory
+      - Stock
+      - Supplies Value
+      - Raw Materials
+      - Finished Goods
+      - Stock in Trade
+      - Goods Value
+      - Merchandise
+      - Stock/Inventory
+
   bi_value:
-    desc: Business interruption value
+    desc: Business interruption or loss of income amount
     type: amount
-  other_value:
-    desc: Other insured values
-    type: amount
-  tiv:
-    desc: Total Insured Value
-    type: amount
-  flood_zone:
-    desc: FEMA flood zone
+    synonyms:
+      - BI Value
+      - BI Val
+      - Business Interruption
+      - Business Income
+      - BI
+      - BI Amount
+      - Business Interruption Value
+      - BI Amt
+      - Loss of Income
+      - Loss of Profits
+      - BI/Loss of Income
+      - Time Element
+      - Gross Profit
+      - Gross Earnings
+      - Business Interruption Amount
+      - BI Sum Insured
+
+  bi_indemnity_period:
+    desc: Business interruption indemnity period in months
     type: text
-  earthquake_zone:
-    desc: Earthquake zone
+    synonyms:
+      - Indemnity Period
+      - BI Indemnity Period
+      - BI Period
+      - Indemnity Period (Months)
+      - IP
+      - IP (Months)
+      - Loss Period
+      - BI Indemnity
+      - Restoration Period
+      - Period of Indemnity
+      - Maximum Indemnity Period
+      - Max Indemnity Period
+
+  occupancy_type:
+    desc: Occupancy class or use type of the property
     type: text
-  sprinklered:
-    desc: Whether property is sprinklered
-    type: boolean
-  policy_limit:
-    desc: Coverage or policy limit
+    synonyms:
+      - Occupancy
+      - Occupancy Type
+      - Occ Type
+      - Use Type
+      - Occupancy Class
+      - Building Use
+      - Property Use
+      - Occ Class
+      - Occupancy Code
+      - Risk Type
+      - Premises Type
+      - Property Type
+      - Usage
+
+  construction_class:
+    desc: Construction class or type of the building
+    type: text
+    synonyms:
+      - Construction
+      - Construction Type
+      - Const Type
+      - Construction Class
+      - Bldg Construction
+      - Const Class
+      - Construction Code
+      - Building Type
+      - Structural Type
+      - Construction Grade
+      - Const
+      - Frame Type
+
+  year_built:
+    desc: Year the building was originally constructed
+    type: year
+    synonyms:
+      - Year Built
+      - Yr Built
+      - Year Constructed
+      - Built Year
+      - Yr Const
+      - Date Built
+      - Construction Year
+      - Year of Construction
+      - Built
+      - Age of Building
+
+  building_height:
+    desc: Height of the building in meters or feet
+    type: text
+    synonyms:
+      - Building Height
+      - Bldg Height
+      - Height
+      - Height (m)
+      - Height (ft)
+      - Structure Height
+      - Total Height
+      - Roof Height
+
+  number_of_floors:
+    desc: Number of floors or stories in the building
+    type: integer
+    synonyms:
+      - "# Stories"
+      - Stories
+      - Num Stories
+      - Number of Stories
+      - Floors
+      - "# Floors"
+      - Number of Floors
+      - No. of Stories
+      - Storeys
+      - No. of Floors
+      - Floor Count
+      - Num Floors
+      - "# of Floors"
+      - Levels
+      - No of Storeys
+
+  floor_area:
+    desc: Total floor area of the building in square feet or square meters
     type: amount
-  deductible:
-    desc: Deductible amount
-    type: amount
-  latitude:
-    desc: Latitude coordinate
-    type: coordinate
-  longitude:
-    desc: Longitude coordinate
-    type: coordinate
+    synonyms:
+      - Floor Area
+      - Square Footage
+      - Sq Ft
+      - Sq. Ft.
+      - Area
+      - Building Area
+      - Total Area
+      - Square Feet
+      - SF
+      - Gross Area
+      - GFA
+      - Gross Floor Area
+      - Total Floor Area
+      - Built Up Area
+      - Carpet Area
+      - Floor Space
+      - Area (sqft)
+      - Area (sqm)

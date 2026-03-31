@@ -14,12 +14,14 @@ import logging
 import os
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import boto3
 import openpyxl
 import pandas as pd
+import xlrd
 import yaml
 from botocore.config import Config as BotoConfig
 
@@ -32,6 +34,13 @@ logger = logging.getLogger("sov")
 
 
 def configure_logging(level: int = logging.INFO) -> None:
+    """Configure the root logger with a stderr handler if none exist.
+
+    Parameters
+    ----------
+    level
+        Minimum log level for the root logger (default: :data:`logging.INFO`).
+    """
     root = logging.getLogger()
     if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
@@ -51,7 +60,29 @@ _DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
 
 def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
-    """Load unified config from YAML.  Returns dict with bedrock, sheets, fields."""
+    """Load unified SOV configuration from YAML.
+
+    Parses ``fields`` into descriptions, optional ``type`` and ``synonyms`` per field,
+    merges ``learned_synonyms.yaml`` when present, and returns augmented keys
+    ``field_types`` and ``synonyms`` alongside ``fields``.
+
+    Parameters
+    ----------
+    path
+        Path to ``config.yaml``. Defaults to ``config.yaml`` next to the project root.
+
+    Returns
+    -------
+    dict
+        Configuration including ``fields``, ``field_types``, ``synonyms``, ``bedrock``, etc.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the config file does not exist.
+    ValueError
+        If ``fields`` is missing or empty.
+    """
     p = Path(path) if path else _DEFAULT_CONFIG
     if not p.is_file():
         raise FileNotFoundError(f"Config not found: {p}")
@@ -65,23 +96,45 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
     if not isinstance(raw_fields, dict) or not raw_fields:
         raise ValueError(f"'fields' must be a non-empty mapping in {p}")
 
-    schema: dict[str, str] = {}       # field → description (for LLM)
+    schema: dict[str, str] = {}  # field → description (for LLM)
     field_types: dict[str, str] = {}  # field → type (for validation)
+    synonyms: dict[str, list[str]] = {}  # field → list of known header names
 
     for k, v in raw_fields.items():
         if isinstance(v, dict):
             desc = v.get("desc", "")
             ftype = v.get("type", "text")
+            syns = v.get("synonyms", [])
         else:
             desc = str(v) if v else ""
             ftype = "text"
+            syns = []
         if not desc.strip():
             raise ValueError(f"Field '{k}' must have a non-empty description in {p}")
         schema[k] = desc.strip()
         field_types[k] = ftype.strip().lower()
+        synonyms[k] = [str(s).strip() for s in syns if s]
+
+    # Load learned synonyms (human feedback file)
+    learned_path = p.parent / "learned_synonyms.yaml"
+    if learned_path.is_file():
+        with open(learned_path, encoding="utf-8") as f:
+            learned = yaml.safe_load(f) or {}
+        for field, syns_list in learned.items():
+            if field in synonyms and isinstance(syns_list, list):
+                existing = {s.lower() for s in synonyms[field]}
+                for s in syns_list:
+                    if isinstance(s, dict):
+                        s = s.get("name", "")
+                    s = str(s).strip()
+                    if s and s.lower() not in existing:
+                        synonyms[field].append(s)
+                        existing.add(s.lower())
+        logger.info("Loaded learned synonyms from %s", learned_path)
 
     cfg["fields"] = schema
     cfg["field_types"] = field_types
+    cfg["synonyms"] = synonyms
 
     return cfg
 
@@ -138,6 +191,7 @@ def _extract_cell_value(cell) -> object:
 
 
 def _open_workbook(filepath: str) -> openpyxl.Workbook:
+    """Load an ``.xlsx`` workbook with evaluated cell values (``data_only=True``)."""
     return openpyxl.load_workbook(filepath, data_only=True)
 
 
@@ -187,9 +241,7 @@ def _read_sheet_rows(
 
 
 def _read_xls_rows(filepath: str, sheet_index: int, max_rows: int = 60) -> List[List]:
-    """Read legacy .xls files via xlrd."""
-    import xlrd
-
+    """Read legacy ``.xls`` files via :mod:`xlrd`."""
     wb = xlrd.open_workbook(filepath)
     ws = wb.sheet_by_index(sheet_index)
     return [
@@ -208,7 +260,7 @@ def read_raw_rows(
     if ext == "xlsx":
         wb = _open_workbook(filepath)
         return _read_sheet_rows(wb, sheet_index, max_rows)
-    elif ext == "xls":
+    if ext == "xls":
         return _read_xls_rows(filepath, sheet_index, max_rows)
     raise ValueError(f"Unsupported format: .{ext}")
 
@@ -236,14 +288,14 @@ def get_all_sheet_previews(
         wb = _open_workbook(filepath)
         for idx, ws in enumerate(wb.worksheets):
             rows = _read_sheet_rows(wb, idx, max_rows=preview_rows)
-            previews.append({
-                "index": idx,
-                "name": ws.title,
-                "preview": rows_to_preview(rows, max_rows=preview_rows),
-            })
+            previews.append(
+                {
+                    "index": idx,
+                    "name": ws.title,
+                    "preview": rows_to_preview(rows, max_rows=preview_rows),
+                }
+            )
     elif ext == "xls":
-        import xlrd
-
         wb = xlrd.open_workbook(filepath)
         for idx in range(wb.nsheets):
             ws = wb.sheet_by_index(idx)
@@ -251,11 +303,13 @@ def get_all_sheet_previews(
                 [ws.cell_value(r, c) for c in range(ws.ncols)]
                 for r in range(min(preview_rows, ws.nrows))
             ]
-            previews.append({
-                "index": idx,
-                "name": ws.sheet_by_index(idx).name if hasattr(ws, "name") else f"Sheet{idx}",
-                "preview": rows_to_preview(rows, max_rows=preview_rows),
-            })
+            previews.append(
+                {
+                    "index": idx,
+                    "name": getattr(ws, "name", f"Sheet{idx}"),
+                    "preview": rows_to_preview(rows, max_rows=preview_rows),
+                }
+            )
     else:
         raise ValueError(f"Unsupported format: .{ext}")
 
@@ -271,14 +325,27 @@ def _get_bedrock_client(
     region: Optional[str] = None,
     profile_name: Optional[str] = None,
 ) -> Any:
+    """Build a Bedrock runtime client with retries and a configurable region or profile."""
     region = region or os.environ.get("AWS_REGION", _DEFAULT_REGION)
     cfg = BotoConfig(
         region_name=region,
         retries={"max_attempts": 3, "mode": "adaptive"},
         read_timeout=120,
     )
-    session = boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
+    session = (
+        boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
+    )
     return session.client("bedrock-runtime", config=cfg)
+
+
+_SYSTEM_PROMPT = (
+    "You are a JSON-only response bot. You MUST respond with a single valid JSON object. "
+    "NEVER include markdown, code fences, backticks, explanations, comments, or any text "
+    "outside the JSON. Your entire response must be parseable by json.loads(). "
+    "Start your response with { and end with }. Nothing else."
+)
+
+_MAX_RETRIES = 2
 
 
 def _call_bedrock(
@@ -302,6 +369,7 @@ def _call_bedrock(
 
     resp = client.converse(
         modelId=model_id,
+        system=[{"text": _SYSTEM_PROMPT}],
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={"maxTokens": tokens, "temperature": 0.0},
     )
@@ -315,8 +383,7 @@ def _call_bedrock(
     )
 
     raw = resp["output"]["message"]["content"][0]["text"].strip()
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
+    raw = _strip_to_json(raw)
 
     return {
         "model_id": model_id,
@@ -327,8 +394,379 @@ def _call_bedrock(
     }
 
 
+def _strip_to_json(text: str) -> str:
+    """Aggressively strip non-JSON wrapping from LLM output."""
+    # Remove markdown fences
+    text = re.sub(r"^```[a-z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    text = text.strip()
+
+    # If response has text before the JSON, find the first {
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+        text = text[first_brace : last_brace + 1]
+
+    return text
+
+
+def _parse_llm_json(
+    llm_resp: Dict[str, Any],
+    bedrock_cfg: Dict[str, Any],
+    context: str = "LLM response",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Parse JSON from LLM response, retrying once if it fails.
+
+    Returns (parsed_dict, final_llm_response).
+    """
+    raw = llm_resp["raw_response"]
+
+    # Attempt 1: parse the response
+    try:
+        return json.loads(raw), llm_resp
+    except json.JSONDecodeError as err:
+        logger.warning(
+            "%s: JSON parse failed (%s), retrying with correction prompt", context, err
+        )
+
+        # Attempt 2: send the broken response back and ask for a fix
+        correction_prompt = (
+            f"Your previous response was not valid JSON. Here is what you returned:\n\n"
+            f"{raw}\n\n"
+            f"The JSON parse error was: {err}\n\n"
+            f"Please return ONLY the corrected valid JSON object. "
+            f"Start with {{ and end with }}. No markdown, no backticks, no explanation."
+        )
+
+        retry_resp = _call_bedrock(correction_prompt, bedrock_cfg)
+        retry_raw = retry_resp["raw_response"]
+
+        try:
+            return json.loads(retry_raw), retry_resp
+        except json.JSONDecodeError as err2:
+            logger.error("%s: JSON parse failed on retry too (%s)", context, err2)
+            logger.error("Raw response (attempt 1): %s", raw[:500])
+            logger.error("Raw response (attempt 2): %s", retry_raw[:500])
+            raise ValueError(
+                f"LLM did not return valid JSON after {_MAX_RETRIES} attempts for {context}. "
+                f"Last error: {err2}"
+            ) from err2
+
+
 def _trunc(s: str, n: int = 80) -> str:
+    """Return ``s`` truncated from the left with an ellipsis prefix if longer than ``n``."""
     return s if len(s) <= n else f"...{s[-n:]}"
+
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+_DEFAULT_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+_EMBED_CACHE_FILE = "embeddings_cache.json"
+
+
+def _embed_text(
+    text: str,
+    bedrock_cfg: Dict[str, Any],
+) -> List[float]:
+    """Embed a single text string using Bedrock Titan Embeddings."""
+    model_id = bedrock_cfg.get("embedding_model_id", _DEFAULT_EMBED_MODEL)
+    client = _get_bedrock_client(
+        region=bedrock_cfg.get("aws_region"),
+        profile_name=bedrock_cfg.get("aws_profile"),
+    )
+    body = json.dumps({"inputText": text})
+    resp = client.invoke_model(modelId=model_id, body=body)
+    result = json.loads(resp["body"].read())
+    return result["embedding"]
+
+
+def _embed_texts_batch(
+    texts: List[str],
+    bedrock_cfg: Dict[str, Any],
+) -> List[List[float]]:
+    """Embed multiple texts (individual calls, Titan doesn't support batch)."""
+    return [_embed_text(t, bedrock_cfg) for t in texts]
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _load_embedding_cache(cache_path: Path) -> Dict[str, Any]:
+    """Load the JSON embedding cache from disk, or return an empty dict if missing."""
+    if cache_path.is_file():
+        with open(cache_path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_embedding_cache(cache_path: Path, cache: Dict[str, Any]) -> None:
+    """Persist the embedding cache to ``cache_path`` as JSON."""
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+
+
+def _get_field_embeddings(
+    schema: Dict[str, str],
+    synonyms: Dict[str, List[str]],
+    bedrock_cfg: Dict[str, Any],
+    cache_path: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Get or compute embeddings for all field descriptions + synonyms.
+
+    Returns {field: {"texts": [...], "vectors": [[...], ...]}}.
+    Caches to disk to avoid re-computing.
+    """
+    cache_file = cache_path or _SCRIPT_DIR / _EMBED_CACHE_FILE
+    cache = _load_embedding_cache(cache_file)
+
+    # Build text list per field: description + all synonyms
+    field_texts: dict[str, list[str]] = {}
+    for field, desc in schema.items():
+        texts = [desc] + synonyms.get(field, [])
+        field_texts[field] = texts
+
+    # Check if cache is up-to-date (same texts)
+    needs_update = False
+    for field, texts in field_texts.items():
+        cached = cache.get(field, {})
+        if cached.get("texts") != texts:
+            needs_update = True
+            break
+
+    if not needs_update and cache:
+        logger.debug("Embedding cache up-to-date (%d fields)", len(cache))
+        return cache
+
+    # Compute embeddings for fields that changed
+    logger.info("Computing embeddings for %d fields...", len(field_texts))
+    total_texts = sum(len(t) for t in field_texts.values())
+    logger.info("Embedding %d total texts (descriptions + synonyms)", total_texts)
+
+    result: dict[str, dict] = {}
+    for field, texts in field_texts.items():
+        cached = cache.get(field, {})
+        if cached.get("texts") == texts:
+            result[field] = cached
+        else:
+            vectors = _embed_texts_batch(texts, bedrock_cfg)
+            result[field] = {"texts": texts, "vectors": vectors}
+
+    _save_embedding_cache(cache_file, result)
+    logger.info("Embedding cache saved to %s", cache_file)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tiered column matching
+# ---------------------------------------------------------------------------
+
+_SIM_THRESHOLD = 0.80
+_CANDIDATE_THRESHOLD = 0.60
+
+
+def _normalize_header(text: str) -> str:
+    """Normalize header text for comparison: lowercase, strip, collapse whitespace."""
+    return re.sub(r"\s+", " ", str(text).strip().lower())
+
+
+def _strip_year_from_header(text: str) -> str:
+    """Remove year patterns like '2025', '(2024)' from header for matching."""
+    return re.sub(r"\s*\(?\b(19|20)\d{2}\b\)?\s*", " ", text).strip()
+
+
+def match_columns_tiered(
+    header_vals: List,
+    schema: Dict[str, str],
+    synonyms: Dict[str, List[str]],
+    bedrock_cfg: Dict[str, Any],
+    embedding_cfg: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, str], Dict[str, str], List[Tuple[int, str]]]:
+    """Match Excel header columns to schema fields using synonyms then embeddings.
+
+    Returns:
+        matched: {col_index_str: field_name} — confident matches
+        match_source: {col_index_str: "synonym"|"embedding(0.92)"} — how each was matched
+        unmatched: [(col_index, header_text)] — columns that couldn't be matched
+    """
+    ecfg = embedding_cfg or {}
+    sim_threshold = ecfg.get("similarity_threshold", _SIM_THRESHOLD)
+    candidate_threshold = ecfg.get("candidate_threshold", _CANDIDATE_THRESHOLD)
+    logger.debug(
+        "Tier 2 embedding thresholds: similarity=%s candidate=%s",
+        sim_threshold,
+        candidate_threshold,
+    )
+
+    # Build synonym lookup: normalized_synonym → field_name
+    syn_lookup: dict[str, str] = {}
+    for field, syns in synonyms.items():
+        for s in syns:
+            syn_lookup[_normalize_header(s)] = field
+        # Also add the field name itself and description
+        syn_lookup[_normalize_header(field)] = field
+        syn_lookup[_normalize_header(schema[field])] = field
+
+    matched: dict[str, str] = {}
+    match_source: dict[str, str] = {}
+    unmatched_cols: list[tuple[int, str]] = []
+    used_fields: set[str] = set()
+
+    # --- Tier 1: Synonym matching ---
+    for col_idx, val in enumerate(header_vals):
+        if val is None:
+            continue
+        raw = str(val).strip()
+        if not raw:
+            continue
+
+        norm = _normalize_header(raw)
+        norm_no_year = _normalize_header(_strip_year_from_header(raw))
+
+        hit = syn_lookup.get(norm) or syn_lookup.get(norm_no_year)
+        if hit and hit not in used_fields:
+            matched[str(col_idx)] = hit
+            match_source[str(col_idx)] = "synonym"
+            used_fields.add(hit)
+        else:
+            unmatched_cols.append((col_idx, raw))
+
+    tier1_count = len(matched)
+    logger.info(
+        "Tier 1 (synonyms): matched %d/%d columns",
+        tier1_count,
+        len([v for v in header_vals if v]),
+    )
+
+    if not unmatched_cols:
+        return matched, match_source, []
+
+    # --- Tier 2: Embedding matching ---
+    remaining_fields = {f for f in schema if f not in used_fields}
+    if not remaining_fields:
+        return matched, match_source, unmatched_cols
+
+    try:
+        field_embeddings = _get_field_embeddings(schema, synonyms, bedrock_cfg)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # Bedrock embedding APIs may raise various transport or model errors.
+        logger.warning("Embedding computation failed (%s), skipping Tier 2", exc)
+        return matched, match_source, unmatched_cols
+
+    # Embed unmatched headers
+    unmatched_texts = [_strip_year_from_header(text) for _, text in unmatched_cols]
+    try:
+        header_vectors = _embed_texts_batch(unmatched_texts, bedrock_cfg)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Header embedding failed (%s), skipping Tier 2", exc)
+        return matched, match_source, unmatched_cols
+
+    still_unmatched: list[tuple[int, str]] = []
+
+    for (col_idx, raw_text), header_vec in zip(unmatched_cols, header_vectors):
+        best_field = None
+        best_score = 0.0
+
+        for field in remaining_fields:
+            if field in used_fields:
+                continue
+            fe = field_embeddings.get(field, {})
+            for vec in fe.get("vectors", []):
+                score = _cosine_similarity(header_vec, vec)
+                if score > best_score:
+                    best_score = score
+                    best_field = field
+
+        if best_field and best_score >= sim_threshold and best_field not in used_fields:
+            matched[str(col_idx)] = best_field
+            match_source[str(col_idx)] = f"embedding({best_score:.2f})"
+            used_fields.add(best_field)
+            logger.info(
+                "  Tier 2: col %d (%r) → %s (%.2f similarity)",
+                col_idx,
+                raw_text,
+                best_field,
+                best_score,
+            )
+        else:
+            still_unmatched.append((col_idx, raw_text))
+
+    tier2_count = len(matched) - tier1_count
+    logger.info("Tier 2 (embeddings): matched %d more columns", tier2_count)
+
+    return matched, match_source, still_unmatched
+
+
+# ---------------------------------------------------------------------------
+# Learned synonym saving
+# ---------------------------------------------------------------------------
+
+
+def save_learned_synonyms(
+    new_mappings: Dict[str, str],
+    header_vals: List,
+    match_source: Dict[str, str],
+    source_file: str,
+    config_path: Optional[Path] = None,
+) -> None:
+    """Save LLM-discovered column mappings as learned synonyms for future runs.
+
+    Only saves mappings that came from the LLM (not already matched by synonym/embedding).
+    """
+    learned_path = (config_path or _SCRIPT_DIR) / "learned_synonyms.yaml"
+
+    existing: dict[str, list] = {}
+    if learned_path.is_file():
+        with open(learned_path, encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+
+    today = date.today().isoformat()
+    changed = False
+
+    for col_idx_str, field in new_mappings.items():
+        if col_idx_str in match_source:
+            continue  # already matched by synonym or embedding, skip
+
+        col_idx = int(col_idx_str)
+        if col_idx >= len(header_vals):
+            continue
+        header_text = str(header_vals[col_idx]).strip()
+        header_no_year = _strip_year_from_header(header_text)
+
+        if not header_no_year:
+            continue
+
+        field_list = existing.setdefault(field, [])
+        existing_names = {
+            (e.get("name", e) if isinstance(e, dict) else str(e)).lower()
+            for e in field_list
+        }
+
+        if header_no_year.lower() not in existing_names:
+            field_list.append(
+                {
+                    "name": header_no_year,
+                    "source": Path(source_file).name,
+                    "date": today,
+                }
+            )
+            changed = True
+            logger.info(
+                "Learned synonym: %r → %s (from %s)", header_no_year, field, source_file
+            )
+
+    if changed:
+        with open(learned_path, "w", encoding="utf-8") as f:
+            yaml.dump(existing, f, default_flow_style=False, allow_unicode=True)
+        logger.info("Updated learned synonyms: %s", learned_path)
 
 
 # ---------------------------------------------------------------------------
@@ -351,34 +789,30 @@ def detect_sov_sheet(
         return 0, None
 
     sheet_info = "\n\n".join(
-        f"### Sheet {p['index']}: \"{p['name']}\"\n{p['preview']}" for p in previews
+        f'### Sheet {p["index"]}: "{p["name"]}"\n{p["preview"]}' for p in previews
     )
 
-    prompt = f"""You are an expert insurance data analyst. A workbook has the following sheets.
-Pick the ONE sheet that is the best Statement of Values (SOV) data sheet — the one with
-row-level property/location records containing addresses, building values, TIV, occupancy, etc.
+    prompt = f"""A workbook has the following sheets. Pick the ONE best SOV data sheet.
 
 {sheet_info}
 
-Return ONLY a JSON object:
-{{"sheet": <single 0-based sheet index of the best SOV data sheet>, "reason": "<brief reason>"}}
+RESPOND WITH THIS EXACT JSON STRUCTURE (no other text):
+{{"sheet": <0-based index>, "reason": "<brief reason>"}}
 
 Rules:
-- Return exactly ONE sheet.
-- YEAR-BASED SHEETS: If multiple sheets contain similar SOV data but for different policy
-  years (e.g. "2022 SOV", "2023 SOV", "2024 SOV", or sheets named by year), ALWAYS pick
-  the sheet with the LATEST / most recent year.
-- Prefer sheets with address columns AND insured value columns (building_value, TIV, etc.).
-- Ignore summary sheets, pivot tables, cover pages, instruction sheets, and blank sheets.
-- If sheets are identical in structure but differ by year, the latest year wins.
-- Return ONLY the JSON — no explanation, no markdown fences.
+- Return exactly ONE sheet — the one with row-level property data (addresses, building values, TIV).
+- YEAR-BASED SHEETS: If multiple sheets have similar SOV data for different years, pick the LATEST year.
+- Ignore summary/pivot/cover/instruction sheets.
+- YOUR ENTIRE RESPONSE MUST BE VALID JSON. No markdown. No backticks. No explanation. Start with {{ end with }}.
 """
 
     llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=100)
-    result = json.loads(llm_resp["raw_response"])
+    result, llm_resp = _parse_llm_json(llm_resp, bedrock_cfg, context="sheet_detection")
     sheet = int(result.get("sheet", 0))
     reason = result.get("reason", "")
-    logger.info("LLM selected sheet %d (%s) — %s", sheet, previews[sheet]["name"], reason)
+    logger.info(
+        "LLM selected sheet %d (%s) — %s", sheet, previews[sheet]["name"], reason
+    )
     return sheet, llm_resp
 
 
@@ -409,9 +843,8 @@ def resolve_sheet_indices(
                 wb = _open_workbook(filepath)
                 names = [ws.title for ws in wb.worksheets]
             else:
-                import xlrd
-                wb = xlrd.open_workbook(filepath)
-                names = wb.sheet_names()
+                xwb = xlrd.open_workbook(filepath)
+                names = xwb.sheet_names()
             if s in names:
                 indices.append(names.index(s))
             else:
@@ -516,7 +949,13 @@ NEVER put the same field in both column_mapping and derived_columns.
 - column_mapping keys are 0-based column indices as strings ("0", "1", "2" ...)
 - Only include columns that map to a schema key
 - data_start_row must be AFTER header_row
-- Return ONLY the JSON — no markdown, no explanation, no code fences
+
+## CRITICAL OUTPUT FORMAT:
+- YOUR ENTIRE RESPONSE MUST BE A SINGLE VALID JSON OBJECT.
+- Start with {{ and end with }}.
+- NO markdown, NO backticks, NO code fences, NO explanation, NO text before or after the JSON.
+- Every string value must be properly quoted. No trailing commas.
+- The response must be directly parseable by Python json.loads().
 """
 
 
@@ -525,20 +964,127 @@ def analyse_sheet(
     schema: Dict[str, str],
     bedrock_cfg: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Send a sheet preview to Bedrock and return (parsed_analysis, llm_response)."""
+    """Send a sheet preview to Bedrock and return (parsed_analysis, llm_response).
+
+    Fallback path — called when tiered matching can't resolve structure.
+    """
     prompt = _build_analysis_prompt(preview_text, schema)
     llm_resp = _call_bedrock(prompt, bedrock_cfg)
-    return json.loads(llm_resp["raw_response"]), llm_resp
+    return _parse_llm_json(llm_resp, bedrock_cfg, context="sheet_analysis")
+
+
+def analyse_sheet_with_prematched(
+    preview_text: str,
+    schema: Dict[str, str],
+    pre_matched: Dict[str, str],
+    match_source: Dict[str, str],
+    unmatched: List[Tuple[int, str]],
+    bedrock_cfg: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Analyse a sheet with pre-matched columns, calling LLM only for structure + unmatched.
+
+    If all columns are matched and no derivations are likely needed, skips the LLM
+    entirely and builds the analysis dict directly.
+
+    Returns (analysis_dict, llm_response_or_None).
+    """
+    schema_desc = "\n".join(f"  - {k}: {v}" for k, v in schema.items())
+
+    # If everything matched, we still need header_row/data_start/skip_patterns from LLM
+    # but with a much smaller prompt
+    pre_match_desc = "\n".join(
+        f"  col {idx} → {field} ({match_source.get(idx, 'matched')})"
+        for idx, field in sorted(pre_matched.items(), key=lambda x: int(x[0]))
+    )
+
+    unmatched_desc = ""
+    if unmatched:
+        unmatched_desc = "\n\nUNMATCHED columns that need your mapping:\n" + "\n".join(
+            f'  col {idx}: "{text}"' for idx, text in unmatched
+        )
+
+    prompt = f"""You are an expert insurance data analyst. I have a property SOV Excel sheet.
+I have ALREADY matched most columns. I need you to:
+1. Determine the structure (header_row, data_start_row, data_end_row)
+2. Map any UNMATCHED columns below (if any)
+3. Determine if any derived columns are needed (sum, concat, split, regex_extract)
+4. Identify skip_row_patterns (TOTAL, subtotal rows etc.)
+
+## TARGET SCHEMA:
+{schema_desc}
+
+## PRE-MATCHED COLUMNS (already resolved — do NOT change these):
+{pre_match_desc}
+{unmatched_desc}
+
+## RAW EXCEL ROWS:
+{preview_text}
+
+RESPOND WITH THIS EXACT JSON STRUCTURE:
+{{
+  "header_row": <0-based row index of header, or null>,
+  "data_start_row": <0-based row index where data begins>,
+  "data_end_row": <0-based row index of last data row, or null>,
+  "multi_year": <true/false>,
+  "selected_year": <latest year int or null>,
+  "all_years_found": [<year ints>],
+  "additional_column_mapping": {{
+    "<col_index>": "<schema_key>"
+  }},
+  "skip_row_patterns": ["TOTAL", "Subtotal"],
+  "derived_columns": [],
+  "sheet_notes": "<brief note>"
+}}
+
+RULES:
+- additional_column_mapping should ONLY contain mappings for unmatched columns.
+- Do NOT re-map pre-matched columns.
+- derived_columns: only if a schema field needs computation from multiple columns.
+- YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
+"""
+
+    llm_resp = _call_bedrock(prompt, bedrock_cfg)
+    result, llm_resp = _parse_llm_json(
+        llm_resp, bedrock_cfg, context="sheet_analysis_prematched"
+    )
+
+    # Merge pre-matched + LLM additional mappings into final column_mapping
+    final_mapping = dict(pre_matched)
+    for idx_str, field in result.get("additional_column_mapping", {}).items():
+        if idx_str not in final_mapping:
+            final_mapping[idx_str] = field
+
+    analysis = {
+        "header_row": result.get("header_row"),
+        "data_start_row": result.get("data_start_row"),
+        "data_end_row": result.get("data_end_row"),
+        "multi_year": result.get("multi_year", False),
+        "selected_year": result.get("selected_year"),
+        "all_years_found": result.get("all_years_found", []),
+        "column_mapping": final_mapping,
+        "skip_row_patterns": result.get("skip_row_patterns", []),
+        "derived_columns": result.get("derived_columns", []),
+        "sheet_notes": result.get("sheet_notes", ""),
+    }
+
+    return analysis, llm_resp
 
 
 # ---------------------------------------------------------------------------
 # Multi-year validation
 # ---------------------------------------------------------------------------
 
-_VALUE_KEYS = frozenset({
-    "building_value", "contents_value", "bi_value", "other_value",
-    "tiv", "policy_limit", "deductible",
-})
+_VALUE_KEYS = frozenset(
+    {
+        "building_value",
+        "contents_value",
+        "bi_value",
+        "other_value",
+        "tiv",
+        "policy_limit",
+        "deductible",
+    }
+)
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 
@@ -554,7 +1100,9 @@ def _validate_year_columns(
         header = str(header_vals[idx]) if idx < len(header_vals) else ""
         years = [int(y) for y in _YEAR_RE.findall(header)]
         if key in _VALUE_KEYS and years and selected_year not in years:
-            logger.info("Dropped col %s (%r): year %s ≠ %s", idx, header, years, selected_year)
+            logger.info(
+                "Dropped col %s (%r): year %s ≠ %s", idx, header, years, selected_year
+            )
             continue
         cleaned[idx_str] = key
     return cleaned
@@ -580,7 +1128,9 @@ def _apply_derivations(
 
         missing = [c for c in src if c not in df_raw.columns]
         if missing:
-            logger.warning("Derivation skipped for %r: missing cols %s", target, missing)
+            logger.warning(
+                "Derivation skipped for %r: missing cols %s", target, missing
+            )
             continue
 
         try:
@@ -593,7 +1143,10 @@ def _apply_derivations(
                 parts = [df_raw[c].fillna("").astype(str).str.strip() for c in src]
                 derived[target] = (
                     pd.DataFrame(parts)
-                    .T.apply(lambda row: sep.join(v for v in row if v), axis=1)
+                    .T.apply(
+                        lambda row, separator=sep: separator.join(v for v in row if v),
+                        axis=1,
+                    )
                     .replace("", pd.NA)
                 )
 
@@ -602,22 +1155,28 @@ def _apply_derivations(
                 part_idx = int(params.get("part_index", 0))
                 series = df_raw[src[0]].astype(str).str.split(delim)
                 derived[target] = series.apply(
-                    lambda p: p[part_idx].strip()
-                    if isinstance(p, list) and len(p) > part_idx
-                    else pd.NA
+                    lambda p, idx=part_idx: (
+                        p[idx].strip()
+                        if isinstance(p, list) and len(p) > idx
+                        else pd.NA
+                    )
                 )
 
             elif dtype == "regex_extract":
                 pattern = params.get("pattern", "")
                 derived[target] = (
-                    df_raw[src[0]].astype(str).str.extract(pattern, expand=False).str.strip()
+                    df_raw[src[0]]
+                    .astype(str)
+                    .str.extract(pattern, expand=False)
+                    .str.strip()
                 )
 
             else:
                 logger.warning("Unknown derivation type %r for %r", dtype, target)
                 continue
 
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Pandas/regex may raise varied errors depending on cell content.
             logger.warning("Derivation failed for %r: %s", target, exc)
 
     return derived
@@ -627,7 +1186,9 @@ def _apply_derivations(
 # Per-cell validation
 # ---------------------------------------------------------------------------
 
-_NA_STRINGS = frozenset({"none", "nan", "n/a", "null", "-", "", "na", "tbd", "#n/a", "#ref!"})
+_NA_STRINGS = frozenset(
+    {"none", "nan", "n/a", "null", "-", "", "na", "tbd", "#n/a", "#ref!"}
+)
 
 
 def _clean_cell(val: object, ftype: str) -> object:
@@ -700,7 +1261,7 @@ def _apply_field_types(
     """Apply per-cell validation to every column that has a type defined."""
     for col in df.columns:
         ftype = field_types.get(col, "text")
-        df[col] = df[col].apply(lambda v: _clean_cell(v, ftype))
+        df[col] = df[col].apply(lambda v, ft=ftype: _clean_cell(v, ft))
     return df
 
 
@@ -730,7 +1291,9 @@ def build_clean_dataframe(
     skip_patterns = [p.lower() for p in analysis.get("skip_row_patterns", [])]
 
     direct_idx = sorted(int(k) for k in col_mapping)
-    derived_idx = sorted(int(c) for r in derived_rules for c in r.get("source_cols", []))
+    derived_idx = sorted(
+        int(c) for r in derived_rules for c in r.get("source_cols", [])
+    )
     all_idx = sorted(set(direct_idx) | set(derived_idx))
 
     end = (data_end + 1) if data_end is not None else len(rows)
@@ -763,7 +1326,9 @@ def build_clean_dataframe(
     df_raw = pd.DataFrame(records)
 
     # Direct column mappings
-    direct = {key: df_raw[idx] for idx, key in col_mapping.items() if idx in df_raw.columns}
+    direct = {
+        key: df_raw[idx] for idx, key in col_mapping.items() if idx in df_raw.columns
+    }
 
     # Build source references for direct mappings
     direct_refs: dict[str, list[str]] = {}
@@ -771,8 +1336,7 @@ def build_clean_dataframe(
         if idx_str in df_raw.columns:
             col_letter = _col_letter(int(idx_str))
             direct_refs[key] = [
-                f"{sheet_prefix}{col_letter}{excel_row}"
-                for excel_row in source_rows
+                f"{sheet_prefix}{col_letter}{excel_row}" for excel_row in source_rows
             ]
 
     # Derived columns
@@ -782,7 +1346,6 @@ def build_clean_dataframe(
     derived_refs: dict[str, list[str]] = {}
     for rule in derived_rules:
         target = rule.get("target", "")
-        dtype = rule.get("type", "")
         src_cols = rule.get("source_cols", [])
         if target not in derived:
             continue
@@ -809,7 +1372,9 @@ def build_clean_dataframe(
         df = _apply_field_types(df, field_types)
     else:
         for col in df.select_dtypes(include="object").columns:
-            df[col] = df[col].astype(str).str.strip().replace({"None": pd.NA, "nan": pd.NA})
+            df[col] = (
+                df[col].astype(str).str.strip().replace({"None": pd.NA, "nan": pd.NA})
+            )
 
     return df, df_sources
 
@@ -826,17 +1391,16 @@ def parse_sov_file(
     config_overrides: Optional[Dict[str, Any]] = None,
     verbose: bool = True,
     preview_rows: int = 60,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """
     Parse a property SOV Excel file end-to-end.
 
     Returns
     -------
-    tuple[DataFrame, dict]
-        Cleaned SOV table and a metadata dict containing:
-        - ``llm_responses``: list of all raw LLM call dicts (model_id, tokens, raw_response)
-        - ``analyses``: list of parsed analysis dicts per sheet
-        - ``sheet_indices``: which sheets were processed
+    tuple[pandas.DataFrame, pandas.DataFrame, dict]
+        ``clean_df`` with normalized columns, ``source_ref_df`` with Excel cell
+        references per cell, and ``metadata`` containing:
+        ``llm_responses``, ``analyses``, and ``sheet_indices``.
     """
     configure_logging()
 
@@ -847,7 +1411,13 @@ def parse_sov_file(
     if config_overrides:
         bedrock = cfg.setdefault("bedrock", {})
         for k, v in config_overrides.items():
-            if k in ("inference_profile_arn", "aws_region", "aws_profile", "model_id", "max_tokens"):
+            if k in (
+                "inference_profile_arn",
+                "aws_region",
+                "aws_profile",
+                "model_id",
+                "max_tokens",
+            ):
                 bedrock[k] = v
             elif k == "sheets":
                 cfg["sheets"] = v
@@ -856,13 +1426,17 @@ def parse_sov_file(
 
     schema = cfg["fields"]
     field_types = cfg.get("field_types", {})
+    synonyms = cfg.get("synonyms", {})
     bedrock_cfg = cfg.get("bedrock", {})
+    embedding_cfg = cfg.get("embedding", {})
 
     llm_responses: list[dict] = []
     analyses: list[dict] = []
 
     # --- Resolve sheets ---
-    sheet_indices, detect_resp = resolve_sheet_indices(fp, cfg.get("sheets"), bedrock_cfg)
+    sheet_indices, detect_resp = resolve_sheet_indices(
+        fp, cfg.get("sheets"), bedrock_cfg
+    )
     if detect_resp:
         llm_responses.append({"step": "sheet_detection", **detect_resp})
     logger.info("Target sheet(s): %s", sheet_indices)
@@ -875,7 +1449,6 @@ def parse_sov_file(
         for i, ws in enumerate(wb.worksheets):
             sheet_names[i] = ws.title
     elif ext == "xls":
-        import xlrd
         xwb = xlrd.open_workbook(fp)
         for i in range(xwb.nsheets):
             sheet_names[i] = xwb.sheet_by_index(i).name
@@ -890,10 +1463,53 @@ def parse_sov_file(
         rows = read_raw_rows(fp, sheet_idx, max_rows=preview_rows)
         preview = rows_to_preview(rows, max_rows=preview_rows)
 
-        logger.info("Analysing structure with LLM (%d rows sampled)", len(rows))
-        analysis, analysis_resp = analyse_sheet(preview, schema, bedrock_cfg)
-        llm_responses.append({"step": f"sheet_{sheet_idx}_analysis", **analysis_resp})
+        # --- Tiered column matching ---
+        # Heuristic: find header row (first row with >3 non-empty cells)
+        header_row_idx = None
+        for ri, row in enumerate(rows):
+            non_empty = [v for v in row if v is not None and str(v).strip()]
+            if len(non_empty) >= 3:
+                header_row_idx = ri
+                break
+        header_vals = rows[header_row_idx] if header_row_idx is not None else []
+
+        pre_matched, match_source, unmatched = match_columns_tiered(
+            header_vals,
+            schema,
+            synonyms,
+            bedrock_cfg,
+            embedding_cfg,
+        )
+
+        # Use reduced LLM prompt with pre-matched columns
+        logger.info(
+            "Tiered matching: %d matched, %d unmatched → calling LLM for structure",
+            len(pre_matched),
+            len(unmatched),
+        )
+        analysis, analysis_resp = analyse_sheet_with_prematched(
+            preview,
+            schema,
+            pre_matched,
+            match_source,
+            unmatched,
+            bedrock_cfg,
+        )
+        if analysis_resp:
+            llm_responses.append(
+                {"step": f"sheet_{sheet_idx}_analysis", **analysis_resp}
+            )
         analyses.append(analysis)
+
+        # Save learned synonyms from LLM-discovered mappings
+        config_dir = Path(config_path).parent if config_path else _SCRIPT_DIR
+        save_learned_synonyms(
+            analysis.get("column_mapping", {}),
+            header_vals,
+            match_source,
+            fp,
+            config_path=config_dir,
+        )
 
         if verbose:
             _log_analysis(analysis, sheet_idx)
@@ -902,20 +1518,26 @@ def parse_sov_file(
         if analysis.get("multi_year") and analysis.get("selected_year"):
             sel_year = int(analysis["selected_year"])
             hdr_idx = analysis.get("header_row")
-            hdr_vals = rows[hdr_idx] if hdr_idx is not None else []
+            hdr_vals_yr = rows[hdr_idx] if hdr_idx is not None else []
             orig = len(analysis["column_mapping"])
             analysis["column_mapping"] = _validate_year_columns(
-                hdr_vals, analysis["column_mapping"], sel_year,
+                hdr_vals_yr,
+                analysis["column_mapping"],
+                sel_year,
             )
             dropped = orig - len(analysis["column_mapping"])
             if dropped and verbose:
                 logger.info("Removed %d stale year column(s)", dropped)
 
-        df, df_src = build_clean_dataframe(rows, analysis, schema, field_types, sheet_name=sname)
+        df, df_src = build_clean_dataframe(
+            rows, analysis, schema, field_types, sheet_name=sname
+        )
         if not df.empty:
             all_dfs.append(df)
             all_sources.append(df_src)
-        logger.info("Sheet %d: %d rows, %d columns", sheet_idx, len(df), len(df.columns))
+        logger.info(
+            "Sheet %d: %d rows, %d columns", sheet_idx, len(df), len(df.columns)
+        )
 
     metadata = {
         "sheet_indices": sheet_indices,
@@ -935,15 +1557,23 @@ def parse_sov_file(
         merged = all_dfs[0]
         merged_src = all_sources[0]
         for df, df_src in zip(all_dfs[1:], all_sources[1:]):
-            new_cols = [c for c in df.columns if c not in merged.columns and c != "location_id"]
+            new_cols = [
+                c for c in df.columns if c not in merged.columns and c != "location_id"
+            ]
             if new_cols:
                 merged = merged.merge(
-                    df[["location_id"] + new_cols], on="location_id", how="left",
+                    df[["location_id"] + new_cols],
+                    on="location_id",
+                    how="left",
                 )
                 merged_src = merged_src.merge(
-                    df_src[["location_id"] + new_cols], on="location_id", how="left",
+                    df_src[["location_id"] + new_cols],
+                    on="location_id",
+                    how="left",
                 )
-        logger.info("Merged %d sheets on location_id → %d rows", len(all_dfs), len(merged))
+        logger.info(
+            "Merged %d sheets on location_id → %d rows", len(all_dfs), len(merged)
+        )
         return merged, merged_src, metadata
 
     result = pd.concat(all_dfs, ignore_index=True)
@@ -953,19 +1583,23 @@ def parse_sov_file(
 
 
 def _log_analysis(analysis: Dict[str, Any], sheet_idx: int = 0) -> None:
+    """Log a human-readable summary of LLM sheet analysis at INFO level."""
     logger.info("")
     logger.info("--- LLM analysis (sheet %d) ---", sheet_idx)
     logger.info("Header row       : %s", analysis.get("header_row"))
     logger.info("Data start row   : %s", analysis.get("data_start_row"))
     logger.info("Data end row     : %s", analysis.get("data_end_row", "auto"))
     if analysis.get("multi_year"):
-        logger.info("Multi-year       : yes, years: %s", analysis.get("all_years_found", []))
+        logger.info(
+            "Multi-year       : yes, years: %s", analysis.get("all_years_found", [])
+        )
         logger.info("Selected year    : %s", analysis.get("selected_year"))
     else:
         logger.info("Multi-year       : no")
     logger.info("Mapped columns   : %d", len(analysis.get("column_mapping", {})))
     for col_idx, norm in sorted(
-        analysis.get("column_mapping", {}).items(), key=lambda x: int(x[0]),
+        analysis.get("column_mapping", {}).items(),
+        key=lambda x: int(x[0]),
     ):
         logger.info("  col %s → %s", col_idx, norm)
     if analysis.get("derived_columns"):
