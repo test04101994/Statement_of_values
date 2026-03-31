@@ -127,7 +127,7 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
                     if isinstance(s, dict):
                         s = s.get("name", "")
                     s = str(s).strip()
-                    if s and s.lower() not in existing:
+                    if s and s.lower() not in ("none", "nan", "") and s.lower() not in existing:
                         synonyms[field].append(s)
                         existing.add(s.lower())
         logger.info("Loaded learned synonyms from %s", learned_path)
@@ -769,10 +769,13 @@ def save_learned_synonyms(
         col_idx = int(col_idx_str)
         if col_idx >= len(header_vals):
             continue
-        header_text = str(header_vals[col_idx]).strip()
+        raw_val = header_vals[col_idx]
+        if raw_val is None or str(raw_val).strip() in ("", "None", "nan"):
+            continue
+        header_text = str(raw_val).strip()
         header_no_year = _strip_year_from_header(header_text)
 
-        if not header_no_year:
+        if not header_no_year or header_no_year.lower() in ("none", "nan"):
             continue
 
         field_list = existing.setdefault(field, [])
