@@ -51,6 +51,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--region", dest="aws_region", help="AWS region")
     p.add_argument("--aws-profile", dest="aws_profile", help="Named AWS CLI profile")
+    p.add_argument("--rebuild-embeddings", action="store_true", help="Force rebuild embedding cache from config synonyms")
     p.add_argument(
         "--sheets", default=None, help="Comma-separated sheet indices or names"
     )
@@ -162,6 +163,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.sheets:
         parts = [s.strip() for s in args.sheets.split(",")]
         overrides["sheets"] = [int(s) if s.isdigit() else s for s in parts]
+
+    # Rebuild embeddings if explicitly asked, then exit
+    if args.rebuild_embeddings:
+        from sov.engine import load_config, rebuild_embedding_cache
+        cfg = load_config(config_path)
+        rebuild_embedding_cache(cfg)
+        logger.info("Embedding cache rebuilt. Run again without --rebuild-embeddings to process files.")
+        return
 
     files = _collect_files(target)
     if not files:

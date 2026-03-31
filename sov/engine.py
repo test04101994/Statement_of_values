@@ -519,42 +519,35 @@ def _get_field_embeddings(
     synonyms: Dict[str, List[str]],
     bedrock_cfg: Dict[str, Any],
     cache_path: Optional[Path] = None,
+    force_rebuild: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
-    """Get or compute embeddings for all field descriptions + synonyms.
+    """Load embeddings from cache. Only rebuilds if forced or cache is missing.
 
     Returns {field: {"texts": [...], "vectors": [[...], ...]}}.
-    Caches to disk to avoid re-computing.
     """
     cache_file = cache_path or _SCRIPT_DIR / _EMBED_CACHE_FILE
     cache = _load_embedding_cache(cache_file)
 
-    # Build text list per field: description + all synonyms
+    # If cache exists and no force rebuild → use it as-is
+    if cache and not force_rebuild:
+        logger.debug("Embedding cache loaded (%d fields)", len(cache))
+        return cache
+
+    # Build fresh embeddings
     field_texts: dict[str, list[str]] = {}
     for field, desc in schema.items():
         texts = [desc] + synonyms.get(field, [])
         field_texts[field] = texts
 
-    # Check if cache is up-to-date (same texts)
-    needs_update = False
-    for field, texts in field_texts.items():
-        cached = cache.get(field, {})
-        if cached.get("texts") != texts:
-            needs_update = True
-            break
-
-    if not needs_update and cache:
-        logger.debug("Embedding cache up-to-date (%d fields)", len(cache))
-        return cache
-
-    # Compute embeddings for fields that changed
-    logger.info("Computing embeddings for %d fields...", len(field_texts))
+    logger.info("Building embedding cache for %d fields...", len(field_texts))
     total_texts = sum(len(t) for t in field_texts.values())
     logger.info("Embedding %d total texts (descriptions + synonyms)", total_texts)
 
     result: dict[str, dict] = {}
     for field, texts in field_texts.items():
+        # Reuse cached vectors for unchanged fields
         cached = cache.get(field, {})
-        if cached.get("texts") == texts:
+        if not force_rebuild and cached.get("texts") == texts:
             result[field] = cached
         else:
             vectors = _embed_texts_batch(texts, bedrock_cfg)
@@ -563,6 +556,16 @@ def _get_field_embeddings(
     _save_embedding_cache(cache_file, result)
     logger.info("Embedding cache saved to %s", cache_file)
     return result
+
+
+def rebuild_embedding_cache(cfg: Dict[str, Any]) -> None:
+    """Force-rebuild the embedding cache from current config synonyms."""
+    _get_field_embeddings(
+        cfg["fields"],
+        cfg.get("synonyms", {}),
+        cfg.get("bedrock", {}),
+        force_rebuild=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +584,20 @@ def _normalize_header(text: str) -> str:
 def _strip_year_from_header(text: str) -> str:
     """Remove year patterns like '2025', '(2024)' from header for matching."""
     return re.sub(r"\s*\(?\b(19|20)\d{2}\b\)?\s*", " ", text).strip()
+
+
+# Keywords that indicate an expiring / prior-year column — must be skipped.
+_EXPIRING_KEYWORDS = re.compile(
+    r"\b(expir|expiring|expired|prior\s+year|previous\s+year|old\s+year|"
+    r"prior\s+yr|prev\s+yr|exp\s|exp\.|renewal\s+from|outgoing|"
+    r"current\s+expiring|expiry)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_expiring_column(header: str) -> bool:
+    """Return True if the header text indicates an expiring / prior-year column."""
+    return bool(_EXPIRING_KEYWORDS.search(header))
 
 
 def match_columns_tiered(
@@ -621,11 +638,18 @@ def match_columns_tiered(
     used_fields: set[str] = set()
 
     # --- Tier 1: Synonym matching ---
+    skipped_expiring: list[tuple[int, str]] = []
+
     for col_idx, val in enumerate(header_vals):
         if val is None:
             continue
         raw = str(val).strip()
         if not raw:
+            continue
+
+        # Skip expiring / prior-year columns entirely
+        if _is_expiring_column(raw):
+            skipped_expiring.append((col_idx, raw))
             continue
 
         norm = _normalize_header(raw)
@@ -638,6 +662,13 @@ def match_columns_tiered(
             used_fields.add(hit)
         else:
             unmatched_cols.append((col_idx, raw))
+
+    if skipped_expiring:
+        logger.info(
+            "Skipped %d expiring/prior-year column(s): %s",
+            len(skipped_expiring),
+            [h for _, h in skipped_expiring],
+        )
 
     tier1_count = len(matched)
     logger.info(
@@ -945,6 +976,14 @@ NEVER put the same field in both column_mapping and derived_columns.
 - NEVER map the same schema key twice
 - Non-value columns (location, address, occupancy) appear once — always include them
 
+## CRITICAL EXPIRING / PRIOR-YEAR COLUMN RULES:
+- NEVER map columns whose header contains any of these words: "Expiring", "Expiry", "Exp",
+  "Prior Year", "Previous Year", "Old Year", "Outgoing", "Renewal From", "Current Expiring".
+- These are old/expiring policy values and must be COMPLETELY IGNORED.
+- Examples to SKIP: "Expiring Building Value", "Exp BI", "Prior Year TIV",
+  "Expiring Rent", "Expiring Sum Insured", "Exp Contents", "Previous Year Limit"
+- Only map CURRENT / RENEWAL / PROPOSED year columns.
+
 ## GENERAL RULES:
 - column_mapping keys are 0-based column indices as strings ("0", "1", "2" ...)
 - Only include columns that map to a schema key
@@ -1040,6 +1079,8 @@ RULES:
 - additional_column_mapping should ONLY contain mappings for unmatched columns.
 - Do NOT re-map pre-matched columns.
 - derived_columns: only if a schema field needs computation from multiple columns.
+- NEVER map columns with "Expiring", "Exp", "Prior Year", "Previous Year", "Outgoing" in the header.
+  These are old/expiring values — skip them completely.
 - YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
 """
 
@@ -1321,7 +1362,8 @@ def build_clean_dataframe(
         source_rows.append(data_start + row_offset + 1)
 
     if not records:
-        return pd.DataFrame(), pd.DataFrame()
+        empty = pd.DataFrame(columns=list(schema.keys()))
+        return empty, empty.copy()
 
     df_raw = pd.DataFrame(records)
 
@@ -1359,13 +1401,16 @@ def build_clean_dataframe(
     all_cols = {**direct, **derived}
     all_refs = {**direct_refs, **derived_refs}
 
-    # Order: schema key order first, then extras
-    ordered = [k for k in schema if k in all_cols]
-    extras = [k for k in all_cols if k not in ordered]
-    final_keys = ordered + extras
+    # ALL schema fields as columns, in config order — missing fields get NA
+    n_rows = len(df_raw)
+    final_keys = list(schema.keys())
 
-    df = pd.DataFrame({k: all_cols[k] for k in final_keys})
-    df_sources = pd.DataFrame({k: all_refs.get(k, [""] * len(df)) for k in final_keys})
+    df = pd.DataFrame({
+        k: all_cols.get(k, pd.Series([pd.NA] * n_rows)) for k in final_keys
+    })
+    df_sources = pd.DataFrame({
+        k: all_refs.get(k, [""] * n_rows) for k in final_keys
+    })
 
     # Apply per-cell type validation
     if field_types:
