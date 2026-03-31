@@ -74,8 +74,17 @@ def _append_sheets_to_source(
     wb.save(source_path)
 
     with pd.ExcelWriter(source_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df.fillna("").to_excel(writer, sheet_name="Cleaned Data", index=False)
-        df_sources.fillna("").to_excel(writer, sheet_name="Source References", index=False)
+        # Convert all NA variants to empty string for clean Excel output
+        df_out = df.copy()
+        for col in df_out.columns:
+            df_out[col] = df_out[col].astype(object).where(df_out[col].notna(), "")
+            df_out[col] = df_out[col].replace({"<NA>": "", "nan": "", "None": "", "NaN": ""})
+        df_src_out = df_sources.copy()
+        for col in df_src_out.columns:
+            df_src_out[col] = df_src_out[col].astype(object).where(df_src_out[col].notna(), "")
+            df_src_out[col] = df_src_out[col].replace({"<NA>": "", "nan": "", "None": "", "NaN": ""})
+        df_out.to_excel(writer, sheet_name="Cleaned Data", index=False)
+        df_src_out.to_excel(writer, sheet_name="Source References", index=False)
 
 
 def process_file(

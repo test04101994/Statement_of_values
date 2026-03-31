@@ -1615,13 +1615,21 @@ def build_clean_dataframe(
     df = _fill_address_fields(df, bedrock_cfg=bedrock_cfg)
 
     # Drop rows where address AND all its constituents are empty — address is the anchor
+    _EMPTY_VALS = {"", "none", "nan", "<na>", "na", "null", "n/a", "-"}
     addr_fields = [f for f in ("address", "town", "state", "zip_code", "country") if f in df.columns]
     if addr_fields:
         before = len(df)
-        mask = df[addr_fields].apply(
-            lambda row: row.notna().any() and any(str(v).strip() not in ("", "None", "nan") for v in row if pd.notna(v)),
-            axis=1,
-        )
+
+        def _has_address_data(row: pd.Series) -> bool:
+            for v in row:
+                if pd.isna(v):
+                    continue
+                s = str(v).strip().lower()
+                if s and s not in _EMPTY_VALS:
+                    return True
+            return False
+
+        mask = df[addr_fields].apply(_has_address_data, axis=1)
         df = df.loc[mask].reset_index(drop=True)
         df_sources = df_sources.loc[mask].reset_index(drop=True)
         dropped = before - len(df)

@@ -29,17 +29,32 @@ fields:
       - Address
       - Street Address
       - Address Line 1
+      - Address Line1
+      - Addr Line 1
       - Property Address
       - Mailing Address
       - Street
       - Addr
       - Address 1
+      - Addr 1
       - Street Addr
       - Location Address
       - Risk Address
       - Site Address
       - Insured Address
       - Premises Address
+      - Location Street
+      - Risk Location
+      - Property Street Address
+      - Physical Address
+      - Loss Location
+      - Location 1
+      - Location Name
+      - Property Location
+      - Risk Site
+      - Situs Address
+      - Loc Address
+      - Building Address
 
   town:
     desc: Town or city name where the property is located
@@ -54,6 +69,19 @@ fields:
       - Town/City
       - Suburb
       - Locality
+      - Location City
+      - Risk City
+      - Property City
+      - Site City
+      - Loc City
+      - Loss City
+      - Village
+      - Borough
+      - District
+      - Metro Area
+      - Urban Area
+      - Place
+      - Location Town
 
   state:
     desc: State or province where the property is located
@@ -66,6 +94,20 @@ fields:
       - Region
       - St
       - Territory
+      - State Name
+      - Prov
+      - Risk State
+      - Location State
+      - Property State
+      - Site State
+      - Loc State
+      - Loss State
+      - State/Prov
+      - State/Territory
+      - Admin Region
+      - County
+      - Division
+      - Prefecture
 
   zip_code:
     desc: ZIP code or postal code
@@ -80,6 +122,19 @@ fields:
       - Zip/Postal
       - Pin Code
       - Pincode
+      - Zip+4
+      - ZIP+4
+      - Risk ZIP
+      - Location ZIP
+      - Property ZIP
+      - Site Postal Code
+      - Loc Zip
+      - Loss Zip
+      - Postal
+      - Post Cd
+      - Zip Cd
+      - Zip/Postal Code
+      - Postal Zip
 
   country:
     desc: Country where the property is located
@@ -90,6 +145,14 @@ fields:
       - Nation
       - Ctry
       - Country Name
+      - Risk Country
+      - Location Country
+      - Property Country
+      - ISO Country
+      - Cntry
+      - Domicile
+      - Jurisdiction
+      - Territory
 
   insured_name:
     desc: Name of the insured party or policyholder
@@ -107,6 +170,22 @@ fields:
       - Assured
       - Name of Insured
       - Insured's Name
+      - Risk Name
+      - Account
+      - Insured Entity
+      - Entity Name
+      - Applicant Name
+      - Applicant
+      - Client
+      - Owner Name
+      - Property Owner
+      - Lessee
+      - Tenant Name
+      - Organization
+      - Company Name
+      - Firm Name
+      - Beneficiary
+      - Policy Name
 
   currency:
     desc: Currency of the insured values
@@ -120,6 +199,14 @@ fields:
       - Currency Type
       - Valuation Currency
       - Policy Currency
+      - Reporting Currency
+      - Base Currency
+      - Local Currency
+      - Curr Code
+      - ISO Currency
+      - Functional Currency
+      - TIV Currency
+      - Value Currency
 
   building_value:
     desc: Insured value of the building or structure
@@ -142,6 +229,29 @@ fields:
       - Real Property Value
       - Building Limit
       - Buildings
+      - Building TIV
+      - Bldg TIV
+      - Real Property
+      - Insured Value (Bldg)
+      - Bldg Insured Value
+      - Building Ins Value
+      - Structure Replacement Cost
+      - Dwelling Value
+      - Dwelling Replacement Cost
+      - Improvement Value
+      - Building Coverage
+      - Coverage A
+      - Cov A
+      - Real Property Limit
+      - Building Declared Value
+      - Declared Value (Building)
+      - Bldg Declared Value
+      - Building Appraisal Value
+      - Reconstruction Value
+      - Reinstatement Value
+      - Reinstatement Cost
+      - Structural Value
+      - Edifice Value
 
   machinery_equipment_value:
     desc: Insured value of machinery, equipment, and furniture
@@ -168,6 +278,36 @@ fields:
       - Business Personal Property
       - Machinery Equipment and Furniture
       - Plant Machinery and Equipment
+      - Contents TIV
+      - BPP TIV
+      - Personal Property Value
+      - Personal Property
+      - Equipment TIV
+      - Machinery TIV
+      - Plant TIV
+      - Equipment Sum Insured
+      - Machinery Sum Insured
+      - Contents Sum Insured
+      - Contents SI
+      - BPP Value
+      - Equipment Limit
+      - Machinery Limit
+      - Contents Limit
+      - Non-Building Value
+      - Equipment Replacement Cost
+      - Machinery Replacement Cost
+      - EDP Equipment
+      - Electronic Equipment
+      - Computer Equipment
+      - Tools & Equipment
+      - Fixtures Value
+      - Trade Fixtures
+      - Leasehold Improvements
+      - Tenant Improvements
+      - Equipment & Fixtures
+      - Coverage B
+      - Cov B
+      - Other Structures
 
   stock_supplies_value:
     desc: Insured value of stock, supplies, and inventory
@@ -186,6 +326,30 @@ fields:
       - Goods Value
       - Merchandise
       - Stock/Inventory
+      - Stock TIV
+      - Inventory TIV
+      - Stock Sum Insured
+      - Stock SI
+      - Stock Limit
+      - Inventory Limit
+      - Inventory Sum Insured
+      - WIP
+      - Work in Progress
+      - Work in Process
+      - Goods in Transit
+      - Goods in Process
+      - Merchandise Value
+      - Product Inventory
+      - Trading Stock
+      - Commodity Value
+      - Perishables
+      - Cold Storage Stock
+      - Seasonal Stock
+      - Peak Season Stock
+      - Max Stock Value
+      - Stock Declared Value
+      - Retail Inventory
+      - Warehouse Stock
 
   bi_value:
     desc: Business interruption or loss of income amount
@@ -207,6 +371,38 @@ fields:
       - Gross Earnings
       - Business Interruption Amount
       - BI Sum Insured
+      - BI TIV
+      - BI Limit
+      - BI SI
+      - Business Income Value
+      - Business Income Limit
+      - Loss of Revenue
+      - Revenue Loss
+      - Income Loss
+      - Profit Loss
+      - BI Coverage
+      - Annual Turnover
+      - Annual Revenue
+      - Gross Revenue
+      - BI Gross Profit
+      - Projected Revenue
+      - MLOP
+      - Maximum Loss of Profit
+      - Extra Expense
+      - Extra Expense Value
+      - Additional Living Expense
+      - Rental Income
+      - Rental Value
+      - Rental Income Value
+      - Rents Receivable
+      - Rent Insurance
+      - Contingent BI
+      - Contingent Business Interruption
+      - CBI
+      - Dependent Properties
+      - Leasehold Interest
+      - BI Annual Turnover
+      - Revenue
 
   bi_indemnity_period:
     desc: Business interruption indemnity period in months
@@ -224,6 +420,20 @@ fields:
       - Period of Indemnity
       - Maximum Indemnity Period
       - Max Indemnity Period
+      - MIP
+      - BI Duration
+      - Recovery Period
+      - Interruption Period
+      - Max BI Period
+      - BI Months
+      - Months of Indemnity
+      - Waiting Period
+      - Deductible Period
+      - Time Limit (Months)
+      - Max Period
+      - Extended Period
+      - Indemnity Limit Period
+      - BI Recovery Period
 
   occupancy_type:
     desc: Occupancy class or use type of the property
@@ -242,6 +452,32 @@ fields:
       - Premises Type
       - Property Type
       - Usage
+      - Building Classification
+      - Risk Classification
+      - Occ
+      - COPE Occupancy
+      - SIC Code
+      - SIC
+      - NAICS Code
+      - NAICS
+      - Industry Code
+      - Industry Type
+      - Business Type
+      - Risk Category
+      - Class of Business
+      - Line of Business
+      - Business Activity
+      - Facility Type
+      - Asset Type
+      - Property Class
+      - Building Purpose
+      - Premises Use
+      - Tenant Use
+      - Building Category
+      - Use Code
+      - ISO Occupancy Code
+      - AAIS Occupancy
+      - Occupancy Description
 
   construction_class:
     desc: Construction class or type of the building
@@ -259,6 +495,32 @@ fields:
       - Construction Grade
       - Const
       - Frame Type
+      - COPE Construction
+      - ISO Construction Class
+      - Construction Category
+      - Construction Description
+      - Wall Type
+      - Exterior Wall
+      - Exterior Wall Type
+      - Wall Construction
+      - Roof Construction
+      - Roof Type
+      - Roof Material
+      - Frame Construction
+      - Structure Type
+      - Building Material
+      - Fire Resistive
+      - Masonry
+      - Wood Frame
+      - Steel Frame
+      - Concrete
+      - Const Code
+      - Construction Rating
+      - ISO Class
+      - AIR Const Class
+      - RMS Const Class
+      - Construction Group
+      - Building Construction Type
 
   year_built:
     desc: Year the building was originally constructed
@@ -274,6 +536,22 @@ fields:
       - Year of Construction
       - Built
       - Age of Building
+      - Year of Build
+      - Build Year
+      - Yr of Construction
+      - Original Construction Year
+      - Original Year Built
+      - COPE Year Built
+      - Year Erected
+      - Year Completed
+      - Completion Year
+      - Effective Year Built
+      - Yr Blt
+      - Building Age
+      - Age
+      - Est. Year Built
+      - Vintage
+      - Year of Manufacture
 
   building_height:
     desc: Height of the building in meters or feet
@@ -287,6 +565,17 @@ fields:
       - Structure Height
       - Total Height
       - Roof Height
+      - Height (meters)
+      - Height (feet)
+      - Bldg Ht
+      - Ht
+      - Max Height
+      - Overall Height
+      - Ridge Height
+      - Eave Height
+      - Wall Height
+      - Floor to Ceiling Height
+      - Parapet Height
 
   number_of_floors:
     desc: Number of floors or stories in the building
@@ -307,6 +596,25 @@ fields:
       - "# of Floors"
       - Levels
       - No of Storeys
+      - No of Stories
+      - No. of Storeys
+      - Total Floors
+      - Total Stories
+      - Total Storeys
+      - Total Levels
+      - Story Count
+      - Storey Count
+      - Above Grade Floors
+      - Above Grade Stories
+      - Number of Levels
+      - Num Levels
+      - "# Levels"
+      - "# of Levels"
+      - Num of Floors
+      - COPE Stories
+      - Floors Above Ground
+      - Floors Above Grade
+      - Height (Floors)
 
   floor_area:
     desc: Total floor area of the building in square feet or square meters
@@ -330,3 +638,36 @@ fields:
       - Floor Space
       - Area (sqft)
       - Area (sqm)
+      - Sq M
+      - Sq. M.
+      - Square Meters
+      - Square Metres
+      - M2
+      - Sqm
+      - Sqft
+      - Rentable Area
+      - Rentable Sq Ft
+      - Net Floor Area
+      - Net Area
+      - NLA
+      - Net Leasable Area
+      - Leasable Area
+      - Usable Area
+      - Usable Sq Ft
+      - Occupied Area
+      - Total Sq Ft
+      - Total SF
+      - Total GFA
+      - Insured Area
+      - Risk Area
+      - Property Area
+      - Footprint
+      - Building Footprint
+      - Plot Area
+      - Site Area
+      - Land Area
+      - Area (sq ft)
+      - Area (sq m)
+      - Bldg Area
+      - Bldg SF
+      - Floor Space Index
