@@ -1457,28 +1457,36 @@ def _parse_single_address_llm(
     fields_needed: List[str],
     bedrock_cfg: Dict[str, Any],
 ) -> Dict[str, str]:
-    """Parse one address into components via LLM. Called per row."""
-    fields_str = ", ".join(fields_needed)
+    """Parse one address into components AND return a cleaned address. Called per row."""
 
-    prompt = f"""Parse this address into its components. Extract ONLY: {fields_str}
+    prompt = f"""Parse and standardize this address. Return ALL of the following fields.
 
-Address: "{address}"
+Raw address: "{address}"
 
 Return ONLY a JSON object:
-{{"town": "...", "state": "...", "zip_code": "...", "country": "..."}}
+{{
+  "address": "<cleaned, standardized full street address — no city/state/zip/country, just street part>",
+  "town": "<city / town / municipality>",
+  "state": "<state / province / region / department>",
+  "zip_code": "<postal code / ZIP / postcode>",
+  "country": "<full country name>"
+}}
 
 Rules:
+- address = ONLY the street portion, cleaned and standardized (e.g. "Ambrosetti 2431" not the full string)
 - town = city / town / municipality / locality
 - state = state / province / county / region / department
-- zip_code = postal code / ZIP / postcode / CEP / PIN
-- country = full country name (e.g. "Argentina", "Brazil", "Belgium", "Austria")
-- If a field cannot be determined, use null
-- Handle ALL international formats: US, UK, European, Latin American, Asian, etc.
+- zip_code = postal code / ZIP / postcode / CEP / PIN code
+- country = full country name (e.g. "Argentina", "Brazil", "Belgium", "United Kingdom")
+- Standardize abbreviations: "St" → "Street", "Blvd" → "Boulevard", "Ave" → "Avenue" etc.
+- Fix capitalization: proper case for all fields
+- If a field cannot be determined from the address, use null
+- Handle ALL international formats: US, UK, European, Latin American, Asian, Middle Eastern, African
 - YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
 """
 
     try:
-        llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=200)
+        llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=300)
         raw = llm_resp["raw_response"]
         result = json.loads(raw)
         if isinstance(result, dict):
@@ -1555,10 +1563,17 @@ def _fill_address_fields(
         if still_missing and bedrock_cfg:
             llm_count += 1
             llm_parsed = _parse_single_address_llm(addr_str, still_missing, bedrock_cfg)
-            for f in still_missing:
+
+            # Update ALL fields from LLM response (including cleaned address)
+            for f in ("address", "town", "state", "zip_code", "country"):
                 val = llm_parsed.get(f)
                 if val and str(val).strip().lower() not in ("null", "none", ""):
-                    df.at[idx, f] = str(val).strip()
+                    cleaned = str(val).strip()
+                    if f == "address":
+                        # Only update address if LLM returned a cleaner version
+                        df.at[idx, f] = cleaned
+                    elif f in still_missing:
+                        df.at[idx, f] = cleaned
 
     if rows_attempted == 0:
         return df
