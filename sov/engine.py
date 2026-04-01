@@ -401,11 +401,21 @@ def _strip_to_json(text: str) -> str:
     text = re.sub(r"\n?```$", "", text)
     text = text.strip()
 
-    # If response has text before the JSON, find the first {
+    # Find the first JSON structure — either { object or [ array
     first_brace = text.find("{")
-    last_brace = text.rfind("}")
-    if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-        text = text[first_brace : last_brace + 1]
+    first_bracket = text.find("[")
+
+    # Pick whichever comes first
+    if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+        # JSON array
+        last_bracket = text.rfind("]")
+        if last_bracket > first_bracket:
+            text = text[first_bracket:last_bracket + 1]
+    elif first_brace != -1:
+        # JSON object
+        last_brace = text.rfind("}")
+        if last_brace > first_brace:
+            text = text[first_brace:last_brace + 1]
 
     return text
 
@@ -1442,50 +1452,41 @@ def _parse_address_usaddress(address: str) -> Dict[str, str]:
         return {}
 
 
-def _parse_addresses_llm(
-    addresses: List[str],
+def _parse_single_address_llm(
+    address: str,
     fields_needed: List[str],
     bedrock_cfg: Dict[str, Any],
-) -> List[Dict[str, str]]:
-    """Use LLM to parse addresses into components. Fallback when usaddress can't handle them.
-
-    Sends all addresses in one batch call to minimize cost.
-    """
-    addr_list = "\n".join(f"  {i}: \"{a}\"" for i, a in enumerate(addresses))
+) -> Dict[str, str]:
+    """Parse one address into components via LLM. Called per row."""
     fields_str = ", ".join(fields_needed)
 
-    prompt = f"""Parse each address below into its components. Extract ONLY these fields: {fields_str}
+    prompt = f"""Parse this address into its components. Extract ONLY: {fields_str}
 
-Addresses:
-{addr_list}
+Address: "{address}"
 
-Return ONLY a JSON array with one object per address, in the same order:
-[
-  {{"town": "...", "state": "...", "zip_code": "...", "country": "..."}},
-  ...
-]
+Return ONLY a JSON object:
+{{"town": "...", "state": "...", "zip_code": "...", "country": "..."}}
 
 Rules:
-- town = city or town name
-- state = state, province, or county
-- zip_code = postal code / ZIP code / postcode
-- country = country name or code
+- town = city / town / municipality / locality
+- state = state / province / county / region / department
+- zip_code = postal code / ZIP / postcode / CEP / PIN
+- country = full country name (e.g. "Argentina", "Brazil", "Belgium", "Austria")
 - If a field cannot be determined, use null
-- Handle US, UK, Canadian, European, Asian, and all international address formats
-- YOUR ENTIRE RESPONSE MUST BE A VALID JSON ARRAY. No markdown. No explanation.
+- Handle ALL international formats: US, UK, European, Latin American, Asian, etc.
+- YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
 """
 
-    llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=4096)
-    raw = llm_resp["raw_response"]
-
     try:
-        results = json.loads(raw)
-        if isinstance(results, list):
-            return results
-    except json.JSONDecodeError:
-        logger.warning("LLM address parsing returned invalid JSON")
+        llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=200)
+        raw = llm_resp["raw_response"]
+        result = json.loads(raw)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("LLM address parse failed for %r: %s", address[:50], e)
 
-    return [{} for _ in addresses]
+    return {}
 
 
 def _is_cell_empty(val: object) -> bool:
@@ -1523,10 +1524,8 @@ def _fill_address_fields(
     except ImportError:
         has_usaddress = False
 
-    llm_needed_indices: list[int] = []
-    llm_needed_addresses: list[str] = []
-    llm_needed_fields: dict[int, list[str]] = {}
     rows_attempted = 0
+    llm_count = 0
 
     for idx, row in df.iterrows():
         addr = row.get("address")
@@ -1552,45 +1551,22 @@ def _fill_address_fields(
             else:
                 still_missing.append(f)
 
-        # Track rows that still have gaps
-        if still_missing:
-            llm_needed_indices.append(idx)
-            llm_needed_addresses.append(addr_str)
-            llm_needed_fields[idx] = still_missing
+        # Tier 2: LLM per row for what usaddress couldn't resolve
+        if still_missing and bedrock_cfg:
+            llm_count += 1
+            llm_parsed = _parse_single_address_llm(addr_str, still_missing, bedrock_cfg)
+            for f in still_missing:
+                val = llm_parsed.get(f)
+                if val and str(val).strip().lower() not in ("null", "none", ""):
+                    df.at[idx, f] = str(val).strip()
 
     if rows_attempted == 0:
         return df
 
-    usaddress_only = rows_attempted - len(llm_needed_indices)
     logger.info(
-        "Address parsing: %d rows attempted, %d fully resolved by usaddress, %d need LLM",
-        rows_attempted, usaddress_only, len(llm_needed_indices),
+        "Address parsing: %d rows attempted, %d needed LLM fallback",
+        rows_attempted, llm_count,
     )
-
-    # Tier 2: LLM fallback for remaining
-    if llm_needed_addresses and bedrock_cfg:
-        # Collect unique fields needed across all rows
-        all_fields_needed = sorted(set(f for fields in llm_needed_fields.values() for f in fields))
-        logger.info(
-            "Calling LLM to parse %d address(es) for fields: %s",
-            len(llm_needed_addresses), ", ".join(all_fields_needed),
-        )
-        llm_results = _parse_addresses_llm(
-            llm_needed_addresses, all_fields_needed, bedrock_cfg,
-        )
-
-        for i, idx in enumerate(llm_needed_indices):
-            if i >= len(llm_results):
-                break
-            parsed = llm_results[i]
-            if not isinstance(parsed, dict):
-                continue
-            for f in llm_needed_fields.get(idx, []):
-                val = parsed.get(f)
-                if val and str(val).strip().lower() not in ("null", "none", ""):
-                    df.at[idx, f] = str(val).strip()
-
-        logger.info("LLM filled remaining %d addresses", len(llm_needed_addresses))
 
     filled = {f: df[f].notna().sum() for f in available_fields}
     logger.info("Address fields filled: %s", filled)

@@ -5,7 +5,10 @@
       "Bash(python create_sample.py)",
       "Bash(pip install:*)",
       "Bash(python main.py sample_sov.xlsx)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python create_sample_addr.py)",
+      "Bash(python main.py sample_sov_addr_only.xlsx -v)",
+      "Bash(python main.py --rebuild-embeddings)"
     ]
   }
 }
