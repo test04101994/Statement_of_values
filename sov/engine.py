@@ -144,7 +144,7 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_CURRENCY_RE = re.compile(r"[$ ,€£¥₹%]")
+_CURRENCY_RE = re.compile(r"[$€£¥₹%,\s]")
 
 
 def _col_letter(col_idx: int) -> str:
@@ -1338,9 +1338,12 @@ def _apply_derivations(
 # Per-cell validation
 # ---------------------------------------------------------------------------
 
-_NA_STRINGS = frozenset(
-    {"none", "nan", "n/a", "null", "-", "", "na", "tbd", "#n/a", "#ref!"}
-)
+_NA_STRINGS = frozenset({
+    "none", "nan", "n/a", "null", "-", "", "na", "tbd", "#n/a", "#ref!",
+    "#value!", "#div/0!", "#name?", "inc in above", "included in above",
+    "incl in above", "included above", "see above", "as above", "refer above",
+    "inc above", "included", "inc", "not applicable", "not available",
+})
 
 
 def _clean_cell(val: object, ftype: str) -> object:
@@ -1480,8 +1483,17 @@ Rules:
 - country = full country name (e.g. "Argentina", "Brazil", "Belgium", "United Kingdom")
 - Standardize abbreviations: "St" → "Street", "Blvd" → "Boulevard", "Ave" → "Avenue" etc.
 - Fix capitalization: proper case for all fields
-- If a field cannot be determined from the address, use null
 - Handle ALL international formats: US, UK, European, Latin American, Asian, Middle Eastern, African
+
+CRITICAL — DO NOT FABRICATE DATA:
+- ONLY extract information that is EXPLICITLY present in the address text.
+- If the address does NOT contain a postal/ZIP code, return zip_code as null. NEVER guess or look up a ZIP code.
+- If the address does NOT mention a country, return country as null. NEVER assume a country.
+- If the address does NOT contain a state/province, return state as null.
+- If the address does NOT contain a city/town, return town as null.
+- NEVER invent, guess, or look up any value that is not directly in the address string.
+- When in doubt, use null.
+
 - YOUR ENTIRE RESPONSE MUST BE VALID JSON. Start with {{ end with }}. No markdown.
 """
 

@@ -107,11 +107,20 @@ def process_file(
 
         _append_sheets_to_source(filepath, df, df_sources)
 
+        # Parse raw_response strings into dicts for readable JSON output
+        for resp in metadata.get("llm_responses", []):
+            raw = resp.get("raw_response", "")
+            if isinstance(raw, str):
+                try:
+                    resp["raw_response"] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    pass  # keep as string if not valid JSON
+
         fname = Path(filepath).stem + "_llm_responses.json"
         out_json = str(Path(output_dir) / fname) if output_dir else filepath.rsplit(".", 1)[0] + "_llm_responses.json"
         Path(out_json).parent.mkdir(parents=True, exist_ok=True)
         with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, default=str)
+            json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
 
         return True, ""
 
