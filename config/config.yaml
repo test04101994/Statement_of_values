@@ -12,6 +12,12 @@ bedrock:
   embedding_model_id: amazon.titan-embed-text-v2:0
 
 # --- Sheet Selection ---
+# sheet_mode: controls how many sheets the LLM picks when auto-detecting.
+#   "best"  → pick the single best sheet (default, fastest)
+#   "all"   → pick ALL sheets that contain property/location data (geography-based files)
+# sheets: override auto-detection with explicit sheet names or indices.
+#   If set, sheet_mode is ignored.
+sheet_mode: best
 sheets: null
 
 # --- Embedding Matching ---
@@ -403,6 +409,36 @@ fields:
       - Leasehold Interest
       - BI Annual Turnover
       - Revenue
+
+  tiv:
+    desc: Total Insured Value (sum of building + machinery/equipment + stock + BI)
+    type: amount
+    synonyms:
+      - TIV
+      - Total Insured Value
+      - Total Value
+      - Total Insured
+      - Total Insurance Value
+      - Sum Insured
+      - Total Ins Value
+      - Total Ins. Value
+      - Total TIV
+      - Total Sum Insured
+      - TSI
+      - Total SI
+      - Aggregate Value
+      - Total Declared Value
+      - Declared Value (Total)
+      - Total Coverage
+      - Total Limit
+      - Overall TIV
+      - Combined TIV
+      - Gross TIV
+      - Net TIV
+      - Total Replacement Value
+      - Total Replacement Cost
+      - TRC
+      - Total Asset Value
 
   bi_indemnity_period:
     desc: Business interruption indemnity period in months

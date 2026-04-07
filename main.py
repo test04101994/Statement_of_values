@@ -1,10 +1,12 @@
 """
 CLI entry point for the SOV Excel parser.
 
+Configuration defaults to ``config/config.yaml``. Sample workbooks live under
+``samples/``.
+
 Usage:
     python main.py <file_or_folder>
-    python main.py /path/to/folder
-    python main.py sov_file.xlsx
+    python main.py samples/sample_sov.xlsx
     python main.py sov_file.xlsx --profile-arn arn:aws:bedrock:...
     python main.py --rebuild-embeddings
 """
@@ -22,14 +24,21 @@ import pandas as pd
 from openpyxl import load_workbook
 from tqdm import tqdm
 
-from sov.engine import configure_logging, parse_sov_file
+from sov.engine import (
+    configure_logging,
+    load_config,
+    parse_sov_file,
+    rebuild_embedding_cache,
+)
 
 warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
 def _resolve(path_str: str) -> str:
+    """Return an absolute path, resolving relative paths against ``SCRIPT_DIR``."""
     p = Path(path_str)
     if not p.is_absolute():
         p = SCRIPT_DIR / p
@@ -37,27 +46,38 @@ def _resolve(path_str: str) -> str:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Define and parse CLI arguments; ``argv`` defaults to ``sys.argv`` when omitted."""
     p = argparse.ArgumentParser(description="Parse property SOV Excel file(s).")
     p.add_argument("path", nargs="?", default=".", help=".xlsx/.xls file OR folder")
-    p.add_argument("--config", default=None, help="Path to config.yaml")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Path to main YAML config (default: config/config.yaml)",
+    )
     p.add_argument("--profile-arn", dest="inference_profile_arn", help="Bedrock inference profile ARN")
     p.add_argument("--region", dest="aws_region", help="AWS region")
     p.add_argument("--aws-profile", dest="aws_profile", help="Named AWS CLI profile")
     p.add_argument("--rebuild-embeddings", action="store_true", help="Force rebuild embedding cache")
     p.add_argument("--sheets", default=None, help="Comma-separated sheet indices or names")
-    p.add_argument("--verbose", "-v", action="store_true", help="Show full logs (default: errors only + progress bar)")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Log detailed SOV engine diagnostics (default: WARNING+ for engine, INFO for CLI)",
+    )
     return p.parse_args(argv)
 
 
 def _collect_files(path: str) -> list[Path]:
+    """Collect ``.xlsx`` / ``.xls`` files from a file path or directory (non-recursive)."""
     p = Path(path)
     if p.is_file():
         return [p]
     if p.is_dir():
         return sorted(
-            f for f in p.iterdir()
-            if f.suffix.lower() in (".xlsx", ".xls")
-            and not f.name.startswith("~$")
+            f
+            for f in p.iterdir()
+            if f.suffix.lower() in (".xlsx", ".xls") and not f.name.startswith("~$")
         )
     raise FileNotFoundError(f"Path not found: {path}")
 
@@ -67,6 +87,7 @@ def _append_sheets_to_source(
     df: pd.DataFrame,
     df_sources: pd.DataFrame,
 ) -> None:
+    """Append ``Cleaned Data`` and ``Source References`` sheets to an existing workbook."""
     wb = load_workbook(source_path)
     for name in ("Cleaned Data", "Source References"):
         if name in wb.sheetnames:
@@ -93,7 +114,24 @@ def process_file(
     overrides: dict | None,
     output_dir: str | None = None,
 ) -> tuple[bool, str]:
-    """Process a single SOV file. Returns (success, error_message)."""
+    """Run the SOV pipeline on one workbook and write JSON metadata.
+
+    Parameters
+    ----------
+    filepath
+        Path to ``.xlsx`` or ``.xls``.
+    config_path
+        Optional path to YAML config; ``None`` uses engine default.
+    overrides
+        Bedrock / sheet overrides merged into config.
+    output_dir
+        Directory for ``*_llm_responses.json``; if ``None``, JSON is next to the input file.
+
+    Returns
+    -------
+    tuple[bool, str]
+        ``(True, "")`` on success; ``(False, error_message)`` on failure.
+    """
     try:
         df, df_sources, metadata = parse_sov_file(
             filepath,
@@ -117,23 +155,33 @@ def process_file(
                     pass  # keep as string if not valid JSON
 
         fname = Path(filepath).stem + "_llm_responses.json"
-        out_json = str(Path(output_dir) / fname) if output_dir else filepath.rsplit(".", 1)[0] + "_llm_responses.json"
+        out_json = (
+            str(Path(output_dir) / fname)
+            if output_dir
+            else filepath.rsplit(".", 1)[0] + "_llm_responses.json"
+        )
         Path(out_json).parent.mkdir(parents=True, exist_ok=True)
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
 
         return True, ""
 
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # Pipeline may fail on I/O, AWS, or parsing; return message for batch summary.
         return False, str(exc)
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments, optionally rebuild embeddings, or process SOV files with a progress bar.
+
+    Exits with code 1 if no spreadsheets are found under the given path.
+    """
     args = _parse_args(argv)
 
-    # Set log level: verbose = full logs, default = errors only
-    log_level = logging.INFO if args.verbose else logging.ERROR
-    configure_logging(level=log_level)
+    # Console logging: always INFO for this CLI; quiet mode suppresses ``sov`` engine detail
+    configure_logging(level=logging.INFO)
+    if not args.verbose:
+        logging.getLogger("sov").setLevel(logging.WARNING)
 
     target = _resolve(args.path)
     config_path = _resolve(args.config) if args.config else None
@@ -151,16 +199,15 @@ def main(argv: list[str] | None = None) -> None:
 
     # Rebuild embeddings if explicitly asked, then exit
     if args.rebuild_embeddings:
-        configure_logging(level=logging.INFO)  # show progress for rebuild
-        from sov.engine import load_config, rebuild_embedding_cache
+        logging.getLogger("sov").setLevel(logging.INFO)
         cfg = load_config(config_path)
         rebuild_embedding_cache(cfg)
-        print("✓ Embedding cache rebuilt.")
+        logger.info("Embedding cache rebuilt.")
         return
 
     files = _collect_files(target)
     if not files:
-        print(f"No .xlsx/.xls files found in {target}")
+        logger.error("No .xlsx/.xls files found in %s", target)
         sys.exit(1)
 
     # Output directory
@@ -186,19 +233,21 @@ def main(argv: list[str] | None = None) -> None:
 
     pbar.close()
 
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"  Done: {success} succeeded, {failed} failed, {len(files)} total")
-    print(f"  Output: JSON → {output_dir}/")
-    print(f"  Sheets added to each source .xlsx file")
-    print(f"{'='*60}")
+    logger.info("%s", "=" * 60)
+    logger.info(
+        "Done: %d succeeded, %d failed, %d total",
+        success,
+        failed,
+        len(files),
+    )
+    logger.info("JSON output directory: %s/", output_dir)
+    logger.info("Cleaned Data / Source References sheets appended to each source workbook")
+    logger.info("%s", "=" * 60)
 
-    # Print errors if any
     if errors:
-        print(f"\n  ERRORS ({len(errors)}):")
+        logger.error("Failures (%d):", len(errors))
         for fname, err in errors:
-            print(f"    ✗ {fname}: {err}")
-        print()
+            logger.error("  %s: %s", fname, err)
 
 
 if __name__ == "__main__":

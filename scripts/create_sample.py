@@ -1,20 +1,26 @@
 """
 Generate a realistic sample SOV Excel file with multiple sheets.
 
-Run with ``python create_sample.py`` from the project directory. Output is
-``sample_sov.xlsx`` in the current working directory.
+Run from the project root::
+
+    python scripts/create_sample.py
+
+Output: ``samples/sample_sov.xlsx``.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_FILENAME = "sample_sov.xlsx"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SAMPLES_DIR = _PROJECT_ROOT / "samples"
+OUTPUT_FILENAME = _SAMPLES_DIR / "sample_sov.xlsx"
 
 
 def _build_workbook() -> openpyxl.Workbook:
@@ -401,6 +407,7 @@ def _build_workbook() -> openpyxl.Workbook:
 def main() -> None:
     """Write ``OUTPUT_FILENAME`` and log sheet names."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    _SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     wb = _build_workbook()
     wb.save(OUTPUT_FILENAME)
     logger.info("Created %s with sheets: %s", OUTPUT_FILENAME, wb.sheetnames)

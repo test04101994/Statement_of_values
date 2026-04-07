@@ -1,4 +1,9 @@
-"""Unit tests for SOV engine helpers (smoke tests)."""
+"""Unit tests for SOV engine helpers (smoke tests).
+
+Run from the project root::
+
+    python -m unittest discover -s tests -v
+"""
 
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ class TestLoadConfig(unittest.TestCase):
             load_config(bad)
 
     def test_default_config_loads(self) -> None:
-        """Project ``config.yaml`` loads with a non-empty ``fields`` map."""
+        """Project ``config/config.yaml`` loads with a non-empty ``fields`` map."""
         cfg = load_config()
         self.assertIsInstance(cfg.get("fields"), dict)
         self.assertGreaterEqual(len(cfg["fields"]), 1)

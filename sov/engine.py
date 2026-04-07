@@ -3,7 +3,7 @@ SOV (Statement of Values) parsing engine.
 
 Single module that handles: config loading, Excel I/O, Bedrock LLM calls,
 sheet auto-detection, DataFrame building, column derivations, and multi-year
-validation.  Add new output columns by editing ``config.yaml`` — no code
+validation.  Add new output columns by editing ``config/config.yaml`` — no code
 changes required.
 """
 
@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import boto3
 import openpyxl
 import pandas as pd
+import usaddress
 import xlrd
 import yaml
 from botocore.config import Config as BotoConfig
@@ -54,7 +55,8 @@ def configure_logging(level: int = logging.INFO) -> None:
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent.parent
-_DEFAULT_CONFIG = _SCRIPT_DIR / "config.yaml"
+_DEFAULT_CONFIG_DIR = _SCRIPT_DIR / "config"
+_DEFAULT_CONFIG = _DEFAULT_CONFIG_DIR / "config.yaml"
 _DEFAULT_REGION = "us-east-1"
 _DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 
@@ -69,7 +71,7 @@ def load_config(path: Union[str, Path, None] = None) -> Dict[str, Any]:
     Parameters
     ----------
     path
-        Path to ``config.yaml``. Defaults to ``config.yaml`` next to the project root.
+        Path to the main YAML file. Defaults to ``config/config.yaml`` under the project root.
 
     Returns
     -------
@@ -238,6 +240,228 @@ def _read_sheet_rows(
 
     max_cols = max((len(r) for r in rows), default=0)
     return [r + [None] * (max_cols - len(r)) for r in rows]
+
+
+def _read_sheet_formulas(
+    filepath: str,
+    sheet_index: int,
+    max_rows: int = 60,
+) -> List[List]:
+    """Read formulas from a .xlsx sheet (data_only=False).
+
+    Returns a grid the same shape as _read_sheet_rows but cells contain
+    the formula string (e.g. ``=A1+B1``) or None if the cell has no formula.
+    """
+    ext = filepath.rsplit(".", 1)[-1].lower()
+    if ext != "xlsx":
+        return []  # xlrd doesn't expose formulas
+
+    wb = openpyxl.load_workbook(filepath, data_only=False)
+    if sheet_index >= len(wb.worksheets):
+        return []
+    ws = wb.worksheets[sheet_index]
+
+    rows: list[list] = []
+    for row_cells in ws.iter_rows(max_row=max_rows):
+        row_vals: list = []
+        for cell in row_cells:
+            val = cell.value
+            if isinstance(val, str) and val.startswith("="):
+                row_vals.append(val)
+            else:
+                row_vals.append(None)
+        rows.append(row_vals)
+
+    max_cols = max((len(r) for r in rows), default=0)
+    return [r + [None] * (max_cols - len(r)) for r in rows]
+
+
+def _extract_formula_info(
+    formula_grid: List[List],
+    analysis: Dict[str, Any],
+    data_start: int,
+    data_end: Optional[int],
+) -> Dict[str, Any]:
+    """Extract formula metadata for mapped columns.
+
+    Returns:
+        {
+            "columns_with_formulas": ["building_value", "tiv", ...],
+            "formula_details": {
+                "building_value": {
+                    "sample_formula": "=G5+H5+I5",
+                    "column_index": 12,
+                    "column_letter": "M",
+                    "formulas_per_row": {"5": "=G5+H5+I5", "6": "=G6+H6+I6", ...}
+                }
+            }
+        }
+    """
+    if not formula_grid:
+        return {"columns_with_formulas": [], "formula_details": {}}
+
+    col_mapping = analysis.get("column_mapping", {})
+    end = (data_end + 1) if data_end is not None else len(formula_grid)
+
+    columns_with_formulas: list[str] = []
+    formula_details: dict[str, dict] = {}
+
+    for col_idx_str, field_name in col_mapping.items():
+        col_idx = int(col_idx_str)
+        formulas_per_row: dict[str, str] = {}
+
+        for row_idx in range(data_start, min(end, len(formula_grid))):
+            row = formula_grid[row_idx]
+            if col_idx < len(row) and row[col_idx] is not None:
+                excel_row = row_idx + 1  # 1-based
+                formulas_per_row[str(excel_row)] = row[col_idx]
+
+        if formulas_per_row:
+            columns_with_formulas.append(field_name)
+            sample = next(iter(formulas_per_row.values()))
+            formula_details[field_name] = {
+                "sample_formula": sample,
+                "column_index": col_idx,
+                "column_letter": _col_letter(col_idx),
+                "formula_count": len(formulas_per_row),
+                "formulas_per_row": formulas_per_row,
+            }
+
+    return {
+        "columns_with_formulas": columns_with_formulas,
+        "formula_details": formula_details,
+    }
+
+
+# Amount fields where formula transparency is especially important
+_AMOUNT_FIELDS_FOR_FORMULA_AUDIT = frozenset({
+    "building_value", "machinery_equipment_value", "stock_supplies_value",
+    "bi_value", "tiv",
+})
+
+
+_TIV_COMPONENTS = ("building_value", "machinery_equipment_value", "stock_supplies_value", "bi_value")
+
+
+def _col_index_from_letter(letter: str) -> int:
+    """Convert Excel column letter to 0-based index (A→0, B→1, AA→26)."""
+    result = 0
+    for ch in letter.upper():
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result - 1
+
+
+def _parse_formula_refs(formula: str) -> List[int]:
+    """Extract 0-based column indices referenced in a formula.
+
+    Handles: =A5+B5+C5, =SUM(A5:D5), =SUM(A5,C5,E5), =A5+SUM(B5:C5)
+    """
+    col_indices: set[int] = set()
+
+    # Match range references like A5:D5
+    for m in re.finditer(r"([A-Z]+)\d+:([A-Z]+)\d+", formula, re.IGNORECASE):
+        start = _col_index_from_letter(m.group(1))
+        end = _col_index_from_letter(m.group(2))
+        for i in range(start, end + 1):
+            col_indices.add(i)
+
+    # Match single cell references like A5, B10
+    for m in re.finditer(r"\b([A-Z]+)\d+\b", formula, re.IGNORECASE):
+        ref = m.group(1)
+        # Skip if this was part of a range (already captured)
+        col_indices.add(_col_index_from_letter(ref))
+
+    return sorted(col_indices)
+
+
+def _analyse_tiv_formula(
+    formula_info: Dict[str, Any],
+    col_mapping: Dict[str, str],
+    header_vals: List,
+) -> Optional[Dict[str, Any]]:
+    """If TIV has a formula, decompose it to identify which columns feed into it.
+
+    Cross-references formula cell refs with col_mapping to classify each
+    source column as building_value, machinery_equipment_value, etc.
+
+    Returns None if TIV has no formula.
+    """
+    tiv_detail = formula_info.get("formula_details", {}).get("tiv")
+    if not tiv_detail:
+        return None
+
+    sample = tiv_detail.get("sample_formula", "")
+    if not sample:
+        return None
+
+    # Get all column indices the TIV formula references
+    source_cols = _parse_formula_refs(sample)
+    tiv_col = tiv_detail.get("column_index")
+
+    # Remove TIV's own column if self-referencing
+    source_cols = [c for c in source_cols if c != tiv_col]
+
+    # Reverse map: col_index → field_name
+    idx_to_field = {int(k): v for k, v in col_mapping.items()}
+
+    # Classify each source column
+    components: list[dict] = []
+    mapped_as_component: list[str] = []
+    unmapped_sources: list[dict] = []
+
+    for col_idx in source_cols:
+        header = str(header_vals[col_idx]).strip() if col_idx < len(header_vals) else f"Col {col_idx}"
+        field = idx_to_field.get(col_idx)
+        col_letter = _col_letter(col_idx)
+
+        entry = {
+            "column_index": col_idx,
+            "column_letter": col_letter,
+            "header": header,
+            "mapped_field": field,
+        }
+
+        if field and field in _TIV_COMPONENTS:
+            entry["tiv_role"] = field
+            mapped_as_component.append(field)
+        elif field:
+            entry["tiv_role"] = f"other ({field})"
+        else:
+            entry["tiv_role"] = "unmapped"
+            unmapped_sources.append(entry)
+
+        components.append(entry)
+
+    # Check completeness
+    missing_components = [c for c in _TIV_COMPONENTS if c not in mapped_as_component]
+
+    result = {
+        "tiv_formula": sample,
+        "tiv_column": _col_letter(tiv_col) if tiv_col is not None else "?",
+        "source_columns": components,
+        "identified_components": mapped_as_component,
+        "missing_components": missing_components,
+        "unmapped_source_columns": unmapped_sources,
+        "is_complete": len(missing_components) == 0 and len(unmapped_sources) == 0,
+    }
+
+    # Log
+    logger.info("TIV formula analysis: %s", sample)
+    for comp in components:
+        logger.info(
+            "  %s (col %s, %r) → %s",
+            comp["column_letter"], comp["column_index"],
+            comp["header"], comp["tiv_role"],
+        )
+    if missing_components:
+        logger.info("  Missing TIV components: %s", missing_components)
+    if unmapped_sources:
+        logger.info(
+            "  Unmapped columns in TIV formula: %s",
+            [u["header"] for u in unmapped_sources],
+        )
+
+    return result
 
 
 def _read_xls_rows(filepath: str, sheet_index: int, max_rows: int = 60) -> List[List]:
@@ -535,7 +759,7 @@ def _get_field_embeddings(
 
     Returns {field: {"texts": [...], "vectors": [[...], ...]}}.
     """
-    cache_file = cache_path or _SCRIPT_DIR / _EMBED_CACHE_FILE
+    cache_file = cache_path or _DEFAULT_CONFIG_DIR / _EMBED_CACHE_FILE
     cache = _load_embedding_cache(cache_file)
 
     # If cache exists and no force rebuild → use it as-is
@@ -762,7 +986,7 @@ def save_learned_synonyms(
 
     Only saves mappings that came from the LLM (not already matched by synonym/embedding).
     """
-    learned_path = (config_path or _SCRIPT_DIR) / "learned_synonyms.yaml"
+    learned_path = (config_path or _DEFAULT_CONFIG_DIR) / "learned_synonyms.yaml"
 
     existing: dict[str, list] = {}
     if learned_path.is_file():
@@ -818,23 +1042,27 @@ def save_learned_synonyms(
 # ---------------------------------------------------------------------------
 
 
-def detect_sov_sheet(
-    filepath: str,
-    bedrock_cfg: Dict[str, Any],
-) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """Ask the LLM which single sheet is the best SOV data source.
-
-    Returns (sheet_index, llm_response_dict). llm_response_dict is None for
-    single-sheet workbooks (no LLM call needed).
-    """
+def _get_sheet_previews_text(filepath: str) -> Tuple[List[Dict], str]:
+    """Get sheet previews and formatted text for LLM prompts."""
     previews = get_all_sheet_previews(filepath, preview_rows=5)
-    if len(previews) == 1:
-        logger.info("Single sheet workbook — using sheet 0 (%s)", previews[0]["name"])
-        return 0, None
-
     sheet_info = "\n\n".join(
         f'### Sheet {p["index"]}: "{p["name"]}"\n{p["preview"]}' for p in previews
     )
+    return previews, sheet_info
+
+
+def detect_sov_sheet_best(
+    filepath: str,
+    bedrock_cfg: Dict[str, Any],
+) -> Tuple[List[int], Optional[Dict[str, Any]]]:
+    """sheet_mode='best' — pick the single best sheet.
+
+    Returns ([sheet_index], llm_response_or_None).
+    """
+    previews, sheet_info = _get_sheet_previews_text(filepath)
+    if len(previews) == 1:
+        logger.info("Single sheet workbook — using sheet 0 (%s)", previews[0]["name"])
+        return [0], None
 
     prompt = f"""A workbook has the following sheets. Pick the ONE best SOV data sheet.
 
@@ -851,27 +1079,76 @@ Rules:
 """
 
     llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=100)
-    result, llm_resp = _parse_llm_json(llm_resp, bedrock_cfg, context="sheet_detection")
+    result, llm_resp = _parse_llm_json(llm_resp, bedrock_cfg, context="sheet_detection_best")
     sheet = int(result.get("sheet", 0))
     reason = result.get("reason", "")
-    logger.info(
-        "LLM selected sheet %d (%s) — %s", sheet, previews[sheet]["name"], reason
-    )
-    return sheet, llm_resp
+    logger.info("LLM selected sheet %d (%s) — %s", sheet, previews[sheet]["name"], reason)
+    return [sheet], llm_resp
+
+
+def detect_sov_sheets_all(
+    filepath: str,
+    bedrock_cfg: Dict[str, Any],
+) -> Tuple[List[int], Optional[Dict[str, Any]]]:
+    """sheet_mode='all' — pick ALL sheets that contain property/location data.
+
+    Returns ([sheet_indices], llm_response_or_None).
+    """
+    previews, sheet_info = _get_sheet_previews_text(filepath)
+    if len(previews) == 1:
+        logger.info("Single sheet workbook — using sheet 0 (%s)", previews[0]["name"])
+        return [0], None
+
+    prompt = f"""A workbook has the following sheets. Identify ALL sheets that contain
+row-level property/location SOV data (addresses, building values, TIV, etc.).
+
+{sheet_info}
+
+RESPOND WITH THIS EXACT JSON STRUCTURE (no other text):
+{{"sheets": [<0-based indices of ALL data sheets>], "skipped": [<indices of skipped sheets>],
+ "reason": "<brief reason>"}}
+
+Rules:
+- Include ALL sheets that have row-level property data — even if split by geography
+  (UK, France, Spain), region, year, or business unit.
+- SKIP summary sheets, pivot tables, cover pages, instruction sheets, blank sheets,
+  and index/contents pages.
+- If sheets represent different geographies or regions, include ALL of them.
+- If sheets represent different years, include ONLY the latest year's sheets.
+- YOUR ENTIRE RESPONSE MUST BE VALID JSON. No markdown. No backticks. No explanation.
+  Start with {{ end with }}.
+"""
+
+    llm_resp = _call_bedrock(prompt, bedrock_cfg, max_tokens=200)
+    result, llm_resp = _parse_llm_json(llm_resp, bedrock_cfg, context="sheet_detection_all")
+    sheets = [int(s) for s in result.get("sheets", [0])]
+    skipped = result.get("skipped", [])
+    reason = result.get("reason", "")
+    selected_names = [previews[i]["name"] for i in sheets if i < len(previews)]
+    logger.info("LLM selected %d sheet(s): %s — %s", len(sheets), selected_names, reason)
+    if skipped:
+        skipped_names = [previews[i]["name"] for i in skipped if i < len(previews)]
+        logger.info("Skipped sheets: %s", skipped_names)
+    return sheets, llm_resp
 
 
 def resolve_sheet_indices(
     filepath: str,
     sheets_cfg: Any,
+    sheet_mode: str,
     bedrock_cfg: Dict[str, Any],
 ) -> Tuple[List[int], Optional[Dict[str, Any]]]:
-    """Resolve configured sheet references to 0-based indices, or auto-detect.
+    """Resolve sheet references to 0-based indices.
 
-    Returns (indices, sheet_detection_llm_response).
+    When ``sheets_cfg`` is set → use explicit sheets (ignores sheet_mode).
+    When ``sheets_cfg`` is null:
+      - sheet_mode='best' → LLM picks 1 best sheet
+      - sheet_mode='all'  → LLM picks ALL data sheets
     """
     if not sheets_cfg:
-        idx, llm_resp = detect_sov_sheet(filepath, bedrock_cfg)
-        return [idx], llm_resp
+        if sheet_mode == "all":
+            return detect_sov_sheets_all(filepath, bedrock_cfg)
+        return detect_sov_sheet_best(filepath, bedrock_cfg)
 
     if not isinstance(sheets_cfg, list):
         sheets_cfg = [sheets_cfg]
@@ -1001,6 +1278,12 @@ NEVER put the same field in both column_mapping and derived_columns.
 - NEVER create derived_columns for town, state, zip_code, or country.
 - These are extracted automatically from the address column by a separate process.
 - Only map them if they have their own dedicated column in the spreadsheet.
+
+## POLICY-LEVEL FIELDS:
+- bi_indemnity_period, currency, and insured_name are usually the SAME for all rows.
+- They may appear as a single value in a title row, header area, or a single column.
+- If you see "Indemnity Period: 24 months" or "Currency: GBP" anywhere in the sheet
+  (even outside the data rows), map it. It will be propagated to all rows automatically.
 
 ## GENERAL RULES:
 - column_mapping keys are 0-based column indices as strings ("0", "1", "2" ...)
@@ -1429,9 +1712,8 @@ _ADDR_SUB_FIELDS = ("town", "state", "zip_code", "country")
 
 
 def _parse_address_usaddress(address: str) -> Dict[str, str]:
-    """Parse a US-style address using the usaddress library."""
+    """Parse a US-style address using the :mod:`usaddress` library."""
     try:
-        import usaddress
         tagged, _ = usaddress.tag(address)
         result: dict[str, str] = {}
 
@@ -1451,16 +1733,21 @@ def _parse_address_usaddress(address: str) -> Dict[str, str]:
             result["zip_code"] = zipcode.strip()
 
         return result
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
+        # usaddress may raise on malformed or non-US-looking strings.
         return {}
 
 
 def _parse_single_address_llm(
     address: str,
-    fields_needed: List[str],
+    _fields_needed: List[str],
     bedrock_cfg: Dict[str, Any],
 ) -> Dict[str, str]:
-    """Parse one address into components AND return a cleaned address. Called per row."""
+    """Parse one address into components and return a cleaned street plus locality fields.
+
+    The second parameter is reserved for future filtering of which keys to request
+    from the model; the prompt currently always asks for all standard fields.
+    """
 
     prompt = f"""Parse and standardize this address. Return ALL of the following fields.
 
@@ -1503,8 +1790,11 @@ CRITICAL — DO NOT FABRICATE DATA:
         result = json.loads(raw)
         if isinstance(result, dict):
             return result
-    except (json.JSONDecodeError, Exception) as e:
-        logger.warning("LLM address parse failed for %r: %s", address[:50], e)
+    except json.JSONDecodeError as err:
+        logger.warning("LLM address parse JSON failed for %r: %s", address[:50], err)
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        # Bedrock / transport errors vary by environment.
+        logger.warning("LLM address parse failed for %r: %s", address[:50], err)
 
     return {}
 
@@ -1538,11 +1828,8 @@ def _fill_address_fields(
     if not available_fields:
         return df
 
+    # ``usaddress`` is a declared dependency; imported at module level.
     has_usaddress = True
-    try:
-        import usaddress  # noqa: F401
-    except ImportError:
-        has_usaddress = False
 
     rows_attempted = 0
     llm_count = 0
@@ -1732,7 +2019,7 @@ def build_clean_dataframe(
     df = _fill_address_fields(df, bedrock_cfg=bedrock_cfg)
 
     # Drop rows where address AND all its constituents are empty — address is the anchor
-    _EMPTY_VALS = {"", "none", "nan", "<na>", "na", "null", "n/a", "-"}
+    empty_vals = {"", "none", "nan", "<na>", "na", "null", "n/a", "-"}
     addr_fields = [f for f in ("address", "town", "state", "zip_code", "country") if f in df.columns]
     if addr_fields:
         before = len(df)
@@ -1742,7 +2029,7 @@ def build_clean_dataframe(
                 if pd.isna(v):
                     continue
                 s = str(v).strip().lower()
-                if s and s not in _EMPTY_VALS:
+                if s and s not in empty_vals:
                     return True
             return False
 
@@ -1752,6 +2039,29 @@ def build_clean_dataframe(
         dropped = before - len(df)
         if dropped:
             logger.info("Dropped %d row(s) with no address data", dropped)
+
+    # Fill policy-level fields: these are typically one value for the entire sheet.
+    # If any row has a value, propagate it to all rows that are empty.
+    policy_level_fields = ("bi_indemnity_period", "currency", "insured_name")
+    for field in policy_level_fields:
+        if field not in df.columns:
+            continue
+        non_empty = df[field].dropna()
+        non_empty = non_empty[non_empty.astype(str).str.strip().str.lower().apply(
+            lambda x: x not in _NA_STRINGS
+        )]
+        if not non_empty.empty:
+            # Use the most common non-empty value
+            fill_val = non_empty.mode().iloc[0] if len(non_empty.mode()) > 0 else non_empty.iloc[0]
+            before_count = df[field].isna().sum()
+            df[field] = df[field].fillna(fill_val)
+            # Also fill string empties
+            df[field] = df[field].apply(
+                lambda v, fv=fill_val: fv if _is_cell_empty(v) else v
+            )
+            filled_count = before_count - df[field].isna().sum()
+            if filled_count > 0:
+                logger.info("Filled %d empty %s cell(s) with '%s' (policy-level)", filled_count, field, fill_val)
 
     return df, df_sources
 
@@ -1769,15 +2079,31 @@ def parse_sov_file(
     verbose: bool = True,
     preview_rows: int = 60,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """
-    Parse a property SOV Excel file end-to-end.
+    """Parse a property SOV Excel file end-to-end.
+
+    Loads ``config/config.yaml`` (or ``config_path``), resolves sheets, runs
+    column matching and Bedrock analysis, builds normalized DataFrames, and
+    fills address sub-fields when configured.
+
+    Parameters
+    ----------
+    filepath
+        Path to ``.xlsx`` or ``.xls``.
+    config_path
+        Optional YAML path; defaults to :data:`_DEFAULT_CONFIG`.
+    config_overrides
+        Merged into loaded config (e.g. ``inference_profile_arn``, ``sheets``).
+    verbose
+        Log per-sheet analysis details when ``True``.
+    preview_rows
+        Rows read from each sheet for LLM preview and matching.
 
     Returns
     -------
     tuple[pandas.DataFrame, pandas.DataFrame, dict]
         ``clean_df`` with normalized columns, ``source_ref_df`` with Excel cell
-        references per cell, and ``metadata`` containing:
-        ``llm_responses``, ``analyses``, and ``sheet_indices``.
+        references per cell, and ``metadata`` with ``llm_responses``,
+        ``analyses``, and ``sheet_indices``.
     """
     configure_logging()
 
@@ -1811,8 +2137,9 @@ def parse_sov_file(
     analyses: list[dict] = []
 
     # --- Resolve sheets ---
+    sheet_mode = cfg.get("sheet_mode", "best")
     sheet_indices, detect_resp = resolve_sheet_indices(
-        fp, cfg.get("sheets"), bedrock_cfg
+        fp, cfg.get("sheets"), sheet_mode, bedrock_cfg
     )
     if detect_resp:
         llm_responses.append({"step": "sheet_detection", **detect_resp})
@@ -1879,7 +2206,7 @@ def parse_sov_file(
         analyses.append(analysis)
 
         # Save learned synonyms from LLM-discovered mappings
-        config_dir = Path(config_path).parent if config_path else _SCRIPT_DIR
+        config_dir = Path(config_path).parent if config_path else _DEFAULT_CONFIG_DIR
         save_learned_synonyms(
             analysis.get("column_mapping", {}),
             header_vals,
@@ -1905,6 +2232,37 @@ def parse_sov_file(
             dropped = orig - len(analysis["column_mapping"])
             if dropped and verbose:
                 logger.info("Removed %d stale year column(s)", dropped)
+
+        # --- Formula detection ---
+        formula_grid = _read_sheet_formulas(fp, sheet_idx, max_rows=preview_rows)
+        formula_info = _extract_formula_info(
+            formula_grid, analysis,
+            analysis.get("data_start_row", 0),
+            analysis.get("data_end_row"),
+        )
+        if formula_info["columns_with_formulas"]:
+            logger.info(
+                "Columns with formulas: %s",
+                ", ".join(formula_info["columns_with_formulas"]),
+            )
+            # Log amount fields specifically
+            for field in formula_info["columns_with_formulas"]:
+                if field in _AMOUNT_FIELDS_FOR_FORMULA_AUDIT:
+                    detail = formula_info["formula_details"][field]
+                    logger.info(
+                        "  %s (col %s): %s (e.g. %s)",
+                        field, detail["column_letter"],
+                        f"{detail['formula_count']} cells with formulas",
+                        detail["sample_formula"],
+                    )
+        analysis["formula_info"] = formula_info
+
+        # TIV formula decomposition — if TIV has a formula, classify its source columns
+        tiv_analysis = _analyse_tiv_formula(
+            formula_info, analysis.get("column_mapping", {}), header_vals,
+        )
+        if tiv_analysis:
+            analysis["tiv_formula_analysis"] = tiv_analysis
 
         df, df_src = build_clean_dataframe(
             rows, analysis, schema, field_types,

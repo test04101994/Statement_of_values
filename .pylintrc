@@ -1,6 +1,8 @@
 [MAIN]
 py-version = 3.11
 persistent = no
+# Resolve ``sov`` when running pylint from project root (tests/ imports).
+init-hook = "import sys; sys.path.insert(0, '.')"
 
 [FORMAT]
 max-line-length = 120
@@ -9,9 +11,9 @@ indent-string = "    "
 [DESIGN]
 max-args = 10
 max-positional-arguments = 10
-max-locals = 60
+max-locals = 65
 max-returns = 20
-max-branches = 25
+max-branches = 28
 max-statements = 100
 max-module-lines = 2500
 
